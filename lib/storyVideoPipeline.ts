@@ -18,17 +18,19 @@ export type StoryVideoLog = (msg: string) => void;
 export const STORY_WIDTH = 1080;
 export const STORY_HEIGHT = 1920;
 
-/** Built-in parkour B-roll (used instead of Pexels / user upload by default). */
-export const DEFAULT_STORY_BROLL = path.join(
-  process.cwd(),
-  "public",
-  "Minecraft Parkour Gameplay NO COPYRIGHT Vertical.mp4"
-);
+/** Built-in parkour B-roll parts (split for GitHub <50MB each). */
+export const DEFAULT_STORY_BROLL_PARTS = [
+  path.join(process.cwd(), "public", "broll", "minecraft-parkour-1.mp4"),
+  path.join(process.cwd(), "public", "broll", "minecraft-parkour-2.mp4"),
+] as const;
+
+/** @deprecated Prefer DEFAULT_STORY_BROLL_PARTS — kept as first-part fallback path. */
+export const DEFAULT_STORY_BROLL = DEFAULT_STORY_BROLL_PARTS[0];
 
 export type BuildStoryVideoOptions = {
   story: string;
   lang?: StoryLang;
-  /** Optional override; otherwise uses DEFAULT_STORY_BROLL */
+  /** Optional override; otherwise random cuts from DEFAULT_STORY_BROLL_PARTS */
   backgroundVideoPath?: string | null;
   onLog?: StoryVideoLog;
 };
@@ -264,16 +266,25 @@ export async function buildStoryVideo(
   await fs.mkdir(outDir, { recursive: true });
   const outPath = path.join(outDir, "story.mp4");
 
-  const brollPath =
-    options.backgroundVideoPath?.trim() || DEFAULT_STORY_BROLL;
-  const usedUpload = Boolean(options.backgroundVideoPath?.trim());
+  const uploadPath = options.backgroundVideoPath?.trim() || "";
+  const usedUpload = Boolean(uploadPath);
+  const brollPool = usedUpload
+    ? [uploadPath]
+    : [...DEFAULT_STORY_BROLL_PARTS];
 
   try {
-    try {
-      await fs.access(brollPath);
-    } catch {
+    const poolMeta: { path: string; dur: number }[] = [];
+    for (const p of brollPool) {
+      try {
+        await fs.access(p);
+        poolMeta.push({ path: p, dur: await probeDurationSec(p) });
+      } catch {
+        /* skip missing part */
+      }
+    }
+    if (poolMeta.length === 0) {
       throw new Error(
-        `B-roll video missing: ${brollPath}. Put the parkour MP4 in public/ or upload one.`
+        `B-roll missing. Add files under public/broll/ (minecraft-parkour-1/2.mp4) or upload one.`
       );
     }
 
@@ -316,15 +327,18 @@ export async function buildStoryVideo(
 
     const sceneDurations = sceneDurationsForVoice(plan, cues, voiceSec);
     const clipPaths: string[] = [];
-    const srcDur = await probeDurationSec(brollPath);
+    const poolLabel = poolMeta.map((m) => path.basename(m.path)).join(" + ");
     onLog(
-      `B-roll: ${path.basename(brollPath)} (${srcDur.toFixed(0)}s) — random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
+      `B-roll: ${poolLabel} — random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
     );
     for (let i = 0; i < plan.scenes.length; i++) {
       const d = sceneDurations[i]!;
       const clipPath = path.join(workDir, `clip-${i}.mp4`);
-      onLog(`Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s`);
-      await cutRandomSegment(brollPath, clipPath, d, srcDur, onLog);
+      const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
+      onLog(
+        `Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${path.basename(src.path)}`
+      );
+      await cutRandomSegment(src.path, clipPath, d, src.dur, onLog);
       clipPaths.push(clipPath);
     }
 
@@ -337,7 +351,7 @@ export async function buildStoryVideo(
       durationSec: voiceSec,
       usedUpload,
       lang,
-      brollSource: path.basename(brollPath),
+      brollSource: poolLabel,
     };
   } finally {
     try {
