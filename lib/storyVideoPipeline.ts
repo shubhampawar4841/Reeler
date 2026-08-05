@@ -18,22 +18,33 @@ export type StoryVideoLog = (msg: string) => void;
 export const STORY_WIDTH = 1080;
 export const STORY_HEIGHT = 1920;
 
-/** Built-in parkour B-roll parts (split for GitHub <50MB each). */
-export const DEFAULT_STORY_BROLL_PARTS = [
-  path.join(process.cwd(), "public", "broll", "minecraft-parkour-1.mp4"),
-  path.join(process.cwd(), "public", "broll", "minecraft-parkour-2.mp4"),
+/** Remote parkour B-roll (downloaded into the job temp dir each run). */
+export const DEFAULT_STORY_BROLL_URLS = [
+  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-1.mp4",
+  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-2.mp4",
 ] as const;
-
-/** @deprecated Prefer DEFAULT_STORY_BROLL_PARTS — kept as first-part fallback path. */
-export const DEFAULT_STORY_BROLL = DEFAULT_STORY_BROLL_PARTS[0];
 
 export type BuildStoryVideoOptions = {
   story: string;
   lang?: StoryLang;
-  /** Optional override; otherwise random cuts from DEFAULT_STORY_BROLL_PARTS */
+  /** Optional local override; otherwise downloads DEFAULT_STORY_BROLL_URLS */
   backgroundVideoPath?: string | null;
   onLog?: StoryVideoLog;
 };
+
+async function downloadBrollUrl(
+  url: string,
+  dest: string,
+  onLog?: StoryVideoLog
+): Promise<void> {
+  onLog?.(`Downloading B-roll ${path.basename(dest)}…`);
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to download B-roll (${res.status}): ${url}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  await fs.writeFile(dest, buf);
+}
 
 function escapePathForFilter(p: string): string {
   return p
@@ -268,24 +279,42 @@ export async function buildStoryVideo(
 
   const uploadPath = options.backgroundVideoPath?.trim() || "";
   const usedUpload = Boolean(uploadPath);
-  const brollPool = usedUpload
-    ? [uploadPath]
-    : [...DEFAULT_STORY_BROLL_PARTS];
 
   try {
-    const poolMeta: { path: string; dur: number }[] = [];
-    for (const p of brollPool) {
+    const poolMeta: { path: string; dur: number; label: string }[] = [];
+    if (usedUpload) {
       try {
-        await fs.access(p);
-        poolMeta.push({ path: p, dur: await probeDurationSec(p) });
+        await fs.access(uploadPath);
+        poolMeta.push({
+          path: uploadPath,
+          dur: await probeDurationSec(uploadPath),
+          label: path.basename(uploadPath),
+        });
       } catch {
-        /* skip missing part */
+        throw new Error(`B-roll upload missing: ${uploadPath}`);
       }
-    }
-    if (poolMeta.length === 0) {
-      throw new Error(
-        `B-roll missing. Add files under public/broll/ (minecraft-parkour-1/2.mp4) or upload one.`
-      );
+    } else {
+      for (let i = 0; i < DEFAULT_STORY_BROLL_URLS.length; i++) {
+        const url = DEFAULT_STORY_BROLL_URLS[i]!;
+        const dest = path.join(workDir, `broll-${i + 1}.mp4`);
+        try {
+          await downloadBrollUrl(url, dest, onLog);
+          poolMeta.push({
+            path: dest,
+            dur: await probeDurationSec(dest),
+            label: path.basename(new URL(url).pathname),
+          });
+        } catch (err) {
+          onLog?.(
+            `Skipping B-roll part ${i + 1}: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+      if (poolMeta.length === 0) {
+        throw new Error(
+          "Failed to download B-roll from Supabase. Check DEFAULT_STORY_BROLL_URLS."
+        );
+      }
     }
 
     onLog(`Planning storyboard with Groq (${lang === "hi" ? "Hindi" : "English"})…`);
@@ -327,7 +356,7 @@ export async function buildStoryVideo(
 
     const sceneDurations = sceneDurationsForVoice(plan, cues, voiceSec);
     const clipPaths: string[] = [];
-    const poolLabel = poolMeta.map((m) => path.basename(m.path)).join(" + ");
+    const poolLabel = poolMeta.map((m) => m.label).join(" + ");
     onLog(
       `B-roll: ${poolLabel} — random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
     );
@@ -336,7 +365,7 @@ export async function buildStoryVideo(
       const clipPath = path.join(workDir, `clip-${i}.mp4`);
       const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
       onLog(
-        `Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${path.basename(src.path)}`
+        `Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${src.label}`
       );
       await cutRandomSegment(src.path, clipPath, d, src.dur, onLog);
       clipPaths.push(clipPath);
