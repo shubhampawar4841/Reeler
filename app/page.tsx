@@ -39,7 +39,6 @@ export default function Home() {
   const [storyVideoUrl, setStoryVideoUrl] = useState<string | null>(null);
   const [storyLogs, setStoryLogs] = useState<LogLine[]>([]);
   const [storyTitle, setStoryTitle] = useState<string | null>(null);
-  const [storyBgVideo, setStoryBgVideo] = useState<File | null>(null);
   const [storyLang, setStoryLang] = useState<"en" | "hi">("en");
   const [ytConnected, setYtConnected] = useState(false);
   const [ytChannel, setYtChannel] = useState<string | null>(null);
@@ -229,9 +228,6 @@ export default function Home() {
       const fd = new FormData();
       fd.append("story", storyText.trim());
       fd.append("lang", storyLang);
-      if (storyBgVideo) {
-        fd.append("video", storyBgVideo);
-      }
       const res = await fetch("/api/story-video", {
         method: "POST",
         body: fd,
@@ -429,12 +425,10 @@ export default function Home() {
             </h2>
             <p className="text-sm text-zinc-400">
               Paste a raw story. Pick <strong className="text-zinc-300">English</strong> or{" "}
-              <strong className="text-zinc-300">Hindi</strong> — Groq writes the narration in that
-              language and length follows the script (not forced to 40s). English uses Kokoro (
-              <code className="text-zinc-500">am_fenrir</code>); Hindi uses Edge male (
-              <code className="text-zinc-500">hi-IN-MadhurNeural</code> — kokoro-js has no{" "}
-              <code className="text-zinc-500">hm_omega</code> yet). Captions lock to real TTS chunks.
-              Optional long B-roll → random segments = VO length, 9:16.
+              <strong className="text-zinc-300">Hindi</strong>. Background is always the built-in{" "}
+              <strong className="text-zinc-300">Minecraft parkour</strong> clip (random cuts = VO
+              length, 9:16 Short). No Pexels. Only <code className="text-zinc-500">story.mp4</code>{" "}
+              is saved under <code className="text-zinc-500">public/output</code>.
             </p>
           </div>
           <fieldset className="flex flex-wrap gap-3">
@@ -478,32 +472,6 @@ export default function Home() {
               placeholder="Write a 30-second horror story about a cabin in the woods…"
               className="w-full resize-y rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
             />
-          </label>
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">
-              Background video <span className="font-normal text-zinc-500">(optional)</span>
-            </span>
-            <input
-              type="file"
-              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
-              disabled={storyLoading}
-              onChange={(e) => {
-                setStoryBgVideo(e.target.files?.[0] ?? null);
-                setStoryError(null);
-                setStoryVideoUrl(null);
-              }}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-rose-700 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-rose-600"
-            />
-            {storyBgVideo ? (
-              <span className="text-xs text-zinc-500">
-                {storyBgVideo.name} ({(storyBgVideo.size / (1024 * 1024)).toFixed(1)} MB) — Pexels
-                off, random cuts → 9:16
-              </span>
-            ) : (
-              <span className="text-xs text-zinc-600">
-                No file → Pexels stock. With file → only your footage, length = VO.
-              </span>
-            )}
           </label>
           <button
             type="button"

@@ -9,7 +9,6 @@ import { buildAssFromVoiceCaptions } from "@/lib/dummyCaptions";
 import type { SubtitleCue } from "@/lib/types";
 import type { Caption } from "@remotion/captions";
 import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
-import { downloadToFile, searchPexelsVideo } from "@/lib/pexels";
 import { synthesizeStoryVoice, type VoiceChunk } from "@/lib/kokoroTts";
 import type { StoryPlan, StoryScene } from "@/lib/storyTypes";
 
@@ -19,10 +18,17 @@ export type StoryVideoLog = (msg: string) => void;
 export const STORY_WIDTH = 1080;
 export const STORY_HEIGHT = 1920;
 
+/** Built-in parkour B-roll (used instead of Pexels / user upload by default). */
+export const DEFAULT_STORY_BROLL = path.join(
+  process.cwd(),
+  "public",
+  "Minecraft Parkour Gameplay NO COPYRIGHT Vertical.mp4"
+);
+
 export type BuildStoryVideoOptions = {
   story: string;
   lang?: StoryLang;
-  /** Optional long B-roll file; when set, skip Pexels and cut random segments totaling VO length. */
+  /** Optional override; otherwise uses DEFAULT_STORY_BROLL */
   backgroundVideoPath?: string | null;
   onLog?: StoryVideoLog;
 };
@@ -237,8 +243,8 @@ async function cutRandomSegment(
 }
 
 /**
- * Story → Groq plan → (Pexels | uploaded B-roll) → VO → captioned 9:16 MP4.
- * Output length follows the voice track (script length), not a fixed 40–60s cap.
+ * Story → Groq plan → Minecraft parkour B-roll (or override) → VO → captioned 9:16 MP4.
+ * Only the final story.mp4 is written under public/output (no plan/captions JSON junk).
  */
 export async function buildStoryVideo(
   options: BuildStoryVideoOptions
@@ -248,20 +254,31 @@ export async function buildStoryVideo(
   durationSec: number;
   usedUpload: boolean;
   lang: StoryLang;
+  brollSource: string;
 }> {
-  const { story, backgroundVideoPath, lang = "en", onLog = console.log } = options;
+  const { story, lang = "en", onLog = console.log } = options;
   const jobId = uuidv4();
   const workDir = path.join(os.tmpdir(), "reeler-story", jobId);
   await fs.mkdir(workDir, { recursive: true });
   const outDir = path.join(process.cwd(), "public", "output", jobId);
   await fs.mkdir(outDir, { recursive: true });
   const outPath = path.join(outDir, "story.mp4");
-  const usedUpload = Boolean(backgroundVideoPath);
+
+  const brollPath =
+    options.backgroundVideoPath?.trim() || DEFAULT_STORY_BROLL;
+  const usedUpload = Boolean(options.backgroundVideoPath?.trim());
 
   try {
+    try {
+      await fs.access(brollPath);
+    } catch {
+      throw new Error(
+        `B-roll video missing: ${brollPath}. Put the parkour MP4 in public/ or upload one.`
+      );
+    }
+
     onLog(`Planning storyboard with Groq (${lang === "hi" ? "Hindi" : "English"})…`);
     const plan = await planStoryWithGroq(story, lang);
-    await fs.writeFile(path.join(outDir, "plan.json"), JSON.stringify(plan, null, 2), "utf8");
     onLog(`Plan ready: "${plan.title}" · ${plan.scenes.length} scene(s)`);
 
     onLog(lang === "hi" ? "Synthesizing Hindi voice-over…" : "Synthesizing English Kokoro voice-over…");
@@ -274,7 +291,6 @@ export async function buildStoryVideo(
     const voicePath = voice.path;
     const voiceSec = await probeDurationSec(voicePath);
     const chunkSum = voice.chunks.reduce((a, c) => a + c.durationSec, 0);
-    // Scale cue clocks to the final WAV (concat can differ slightly from per-part probes)
     const timeScale = chunkSum > 0.05 ? voiceSec / chunkSum : 1;
     onLog(
       `Voice duration: ${voiceSec.toFixed(2)}s (${voice.engine}/${voice.voice}) — caption scale ${timeScale.toFixed(3)}`
@@ -297,46 +313,19 @@ export async function buildStoryVideo(
       }),
       "utf8"
     );
-    await fs.writeFile(
-      path.join(outDir, "captions.json"),
-      JSON.stringify(captions, null, 2),
-      "utf8"
-    );
 
     const sceneDurations = sceneDurationsForVoice(plan, cues, voiceSec);
     const clipPaths: string[] = [];
-
-    if (backgroundVideoPath) {
-      const srcDur = await probeDurationSec(backgroundVideoPath);
-      onLog(
-        `Using your upload (${srcDur.toFixed(0)}s) — random segments totaling ${voiceSec.toFixed(1)}s, crop 9:16, no Pexels`
-      );
-      for (let i = 0; i < plan.scenes.length; i++) {
-        const d = sceneDurations[i]!;
-        const clipPath = path.join(workDir, `clip-${i}.mp4`);
-        onLog(`Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s`);
-        await cutRandomSegment(backgroundVideoPath, clipPath, d, srcDur, onLog);
-        clipPaths.push(clipPath);
-      }
-    } else {
-      for (let i = 0; i < plan.scenes.length; i++) {
-        const sc = plan.scenes[i]!;
-        const d = sceneDurations[i]!;
-        onLog(`Pexels [${i + 1}/${plan.scenes.length}]: ${sc.pexelsQuery}`);
-        let hit;
-        try {
-          hit = await searchPexelsVideo(sc.pexelsQuery);
-        } catch {
-          onLog(`  fallback search for scene ${i + 1}`);
-          hit = await searchPexelsVideo("cinematic landscape nature");
-        }
-        const rawPath = path.join(workDir, `raw-${i}.mp4`);
-        const clipPath = path.join(workDir, `clip-${i}.mp4`);
-        await downloadToFile(hit.downloadUrl, rawPath);
-        await trimClip(rawPath, clipPath, d, onLog);
-        clipPaths.push(clipPath);
-        onLog(`  saved clip ${i + 1} (${d.toFixed(1)}s)`);
-      }
+    const srcDur = await probeDurationSec(brollPath);
+    onLog(
+      `B-roll: ${path.basename(brollPath)} (${srcDur.toFixed(0)}s) — random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
+    );
+    for (let i = 0; i < plan.scenes.length; i++) {
+      const d = sceneDurations[i]!;
+      const clipPath = path.join(workDir, `clip-${i}.mp4`);
+      onLog(`Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s`);
+      await cutRandomSegment(brollPath, clipPath, d, srcDur, onLog);
+      clipPaths.push(clipPath);
     }
 
     onLog("Concatenating clips + voice + captions (9:16)…");
@@ -348,6 +337,7 @@ export async function buildStoryVideo(
       durationSec: voiceSec,
       usedUpload,
       lang,
+      brollSource: path.basename(brollPath),
     };
   } finally {
     try {

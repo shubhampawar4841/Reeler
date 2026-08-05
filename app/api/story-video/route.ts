@@ -119,6 +119,9 @@ export async function POST(req: Request) {
     }
 
     push(`Story received (${story.length} chars, lang=${lang})`);
+    if (!backgroundVideoPath) {
+      push("Using built-in Minecraft parkour B-roll (public/…Vertical.mp4)");
+    }
     const result = await buildStoryVideo({
       story,
       lang,
@@ -132,12 +135,10 @@ export async function POST(req: Request) {
       durationSec: result.durationSec,
       plan: result.plan,
       usedUpload: result.usedUpload,
+      brollSource: result.brollSource,
       lang: result.lang,
       logs,
-      message:
-        result.lang === "hi"
-          ? "Story video ready (Hindi narration, 9:16)."
-          : "Story video ready (English narration, 9:16).",
+      message: `Story Short ready (B-roll: ${result.brollSource}).`,
     });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
