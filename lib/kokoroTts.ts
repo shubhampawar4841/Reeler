@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
-import { KokoroTTS, TextSplitterStream } from "kokoro-js";
+import { KokoroTTS } from "kokoro-js";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { getFfmpegExecutable } from "@/lib/binPaths";
 import type { StoryLang } from "@/lib/groqStoryboard";
@@ -12,6 +12,9 @@ let ttsPromise: Promise<KokoroInstance> | null = null;
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 
+/** Soft char budget for a single Kokoro `generate` call (phoneme / token limit). */
+const KOKORO_ONE_SHOT_MAX_CHARS = 420;
+
 export type VoiceChunk = {
   text: string;
   durationSec: number;
@@ -20,6 +23,7 @@ export type VoiceChunk = {
 export type VoiceResult = {
   path: string;
   durationSec: number;
+  /** Optional segments for logging; captions use Whisper on the final WAV. */
   chunks: VoiceChunk[];
   engine: "kokoro" | "edge";
   voice: string;
@@ -103,6 +107,7 @@ async function concatWavParts(partPaths: string[], outPath: string): Promise<voi
     .map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`)
     .join("\n");
   await fs.writeFile(listFile, listBody, "utf8");
+  // Re-encode so the final WAV has a continuous timeline (no concat demuxer quirks).
   await runFfmpeg([
     "-y",
     "-f",
@@ -111,13 +116,17 @@ async function concatWavParts(partPaths: string[], outPath: string): Promise<voi
     "0",
     "-i",
     listFile,
-    "-c",
-    "copy",
+    "-ar",
+    "24000",
+    "-ac",
+    "1",
+    "-c:a",
+    "pcm_s16le",
     outPath,
   ]);
 }
 
-/** Split long text into ~sentence-ish pieces for Edge TTS / safer payloads. */
+/** Split long text into ~sentence-ish pieces for Edge TTS / safer Kokoro payloads. */
 function splitForTts(text: string, maxChars = 280): string[] {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return [];
@@ -132,7 +141,6 @@ function splitForTts(text: string, maxChars = 280): string[] {
       if (s.length <= maxChars) {
         buf = s;
       } else {
-        // hard-wrap very long run-ons
         for (let i = 0; i < s.length; i += maxChars) {
           parts.push(s.slice(i, i + maxChars).trim());
         }
@@ -152,45 +160,53 @@ async function synthesizeKokoroEn(
   const voice = resolveEnVoice();
   const speed = resolveSpeed();
   onLog?.(
-    `Kokoro EN (${MODEL_ID}, voice=${voice}, speed=${speed}) — first run downloads weights…`
+    `Kokoro EN (${MODEL_ID}, voice=${voice}, speed=${speed}) — one continuous WAV…`
   );
   const tts = await getKokoroTts();
 
   const workDir = path.join(path.dirname(outPath), `kokoro-parts-${Date.now()}`);
   await fs.mkdir(workDir, { recursive: true });
-  const partPaths: string[] = [];
-  const chunks: VoiceChunk[] = [];
 
   try {
-    const splitter = new TextSplitterStream();
-    const stream = tts.stream(splitter, { voice: voice as "af_heart", speed });
-
-    const consumer = (async () => {
-      let i = 0;
-      for await (const { text: chunkText, audio } of stream) {
+    if (text.length <= KOKORO_ONE_SHOT_MAX_CHARS) {
+      const audio = await tts.generate(text, {
+        voice: voice as "af_heart",
+        speed,
+      });
+      await Promise.resolve(audio.save(outPath));
+      onLog?.(`Kokoro EN one-shot generate (${text.length} chars)`);
+    } else {
+      // Phoneme limit: generate sentence groups, then stitch into one continuous WAV.
+      const parts = splitForTts(text, KOKORO_ONE_SHOT_MAX_CHARS);
+      onLog?.(
+        `Kokoro EN ${parts.length} generate() segment(s) → single continuous WAV`
+      );
+      const partPaths: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        const piece = parts[i]!;
         const part = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
+        const audio = await tts.generate(piece, {
+          voice: voice as "af_heart",
+          speed,
+        });
         await Promise.resolve(audio.save(part));
-        const durationSec = await probeDurationSec(part);
-        const t = chunkText.replace(/\s+/g, " ").trim();
         onLog?.(
-          `  [${durationSec.toFixed(2)}s] "${t.slice(0, 55)}${t.length > 55 ? "…" : ""}"`
+          `  segment ${i + 1}/${parts.length}: "${piece.slice(0, 50)}${piece.length > 50 ? "…" : ""}"`
         );
         partPaths.push(part);
-        chunks.push({ text: t, durationSec });
-        i += 1;
       }
-    })();
+      await concatWavParts(partPaths, outPath);
+    }
 
-    splitter.push(text);
-    splitter.close();
-    await consumer;
-
-    if (partPaths.length === 0) throw new Error("Kokoro produced no audio chunks.");
-
-    await concatWavParts(partPaths, outPath);
-    const durationSec = chunks.reduce((a, c) => a + c.durationSec, 0);
-    onLog?.(`Kokoro EN saved (${durationSec.toFixed(1)}s, ${chunks.length} chunks)`);
-    return { path: outPath, durationSec, chunks, engine: "kokoro", voice };
+    const durationSec = await probeDurationSec(outPath);
+    onLog?.(`Kokoro EN saved (${durationSec.toFixed(1)}s continuous WAV)`);
+    return {
+      path: outPath,
+      durationSec,
+      chunks: [{ text, durationSec }],
+      engine: "kokoro",
+      voice,
+    };
   } finally {
     try {
       await fs.rm(workDir, { recursive: true, force: true });
@@ -212,15 +228,13 @@ async function synthesizeEdgeHi(
 ): Promise<VoiceResult> {
   const voice = resolveHiEdgeVoice();
   onLog?.(
-    `Hindi VO via Edge TTS (${voice}) — kokoro-js has no Hindi voices yet; hm_omega-equivalent male =
-     hi-IN-MadhurNeural`
+    `Hindi VO via Edge TTS (${voice}) — sentence splits → one continuous WAV`
   );
 
   const workDir = path.join(path.dirname(outPathWav), `edge-parts-${Date.now()}`);
   await fs.mkdir(workDir, { recursive: true });
   const parts = splitForTts(text, 260);
   const partPaths: string[] = [];
-  const chunks: VoiceChunk[] = [];
 
   try {
     const tts = new MsEdgeTTS();
@@ -237,21 +251,24 @@ async function synthesizeEdgeHi(
       } catch {
         /* ignore */
       }
-      const durationSec = await probeDurationSec(wav);
       onLog?.(
-        `  [${durationSec.toFixed(2)}s] "${piece.slice(0, 40)}${piece.length > 40 ? "…" : ""}"`
+        `  [${i + 1}/${parts.length}] "${piece.slice(0, 40)}${piece.length > 40 ? "…" : ""}"`
       );
       partPaths.push(wav);
-      chunks.push({ text: piece, durationSec });
     }
 
     if (partPaths.length === 0) throw new Error("Edge TTS produced no audio.");
 
-    // Remux to single wav via concat demuxer (same codec)
     await concatWavParts(partPaths, outPathWav);
-    const durationSec = chunks.reduce((a, c) => a + c.durationSec, 0);
-    onLog?.(`Hindi Edge VO saved (${durationSec.toFixed(1)}s, ${chunks.length} chunks)`);
-    return { path: outPathWav, durationSec, chunks, engine: "edge", voice };
+    const durationSec = await probeDurationSec(outPathWav);
+    onLog?.(`Hindi Edge VO saved (${durationSec.toFixed(1)}s continuous WAV)`);
+    return {
+      path: outPathWav,
+      durationSec,
+      chunks: [{ text, durationSec }],
+      engine: "edge",
+      voice,
+    };
   } finally {
     try {
       await fs.rm(workDir, { recursive: true, force: true });
@@ -263,7 +280,7 @@ async function synthesizeEdgeHi(
 
 /**
  * Synthesize story VO. English → kokoro-js. Hindi → Edge (until kokoro-js ships hf_/hm_).
- * Returns per-chunk timings so captions/scene cuts lock to real audio.
+ * Timing for captions comes from Whisper on the final WAV, not TTS chunk probes.
  */
 export async function synthesizeStoryVoice(
   text: string,

@@ -126,7 +126,7 @@ export function buildAssFromVoiceCaptions(
   const alignment = vertical ? 2 : 5;
   const anTag = vertical ? "\\an2" : "\\an5";
   const fontName = (opts?.fontName || "Arial Black").replace(/,/g, "");
-  const leadMs = opts?.leadMs ?? 140;
+  const leadMs = opts?.leadMs ?? 0;
   const wordsPerLine = Math.max(2, opts?.wordsPerLine ?? (vertical ? 4 : 5));
 
   const tokens = captions

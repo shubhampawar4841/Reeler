@@ -6,10 +6,9 @@ import { v4 as uuidv4 } from "uuid";
 import { getFfmpegExecutable } from "@/lib/binPaths";
 import { VIDEO_FPS } from "@/lib/ffmpeg";
 import { buildAssFromVoiceCaptions } from "@/lib/dummyCaptions";
-import type { SubtitleCue } from "@/lib/types";
-import type { Caption } from "@remotion/captions";
 import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
-import { synthesizeStoryVoice, type VoiceChunk } from "@/lib/kokoroTts";
+import { synthesizeStoryVoice } from "@/lib/kokoroTts";
+import { alignVoiceCaptions } from "@/lib/alignVoiceCaptions";
 import type { StoryPlan, StoryScene } from "@/lib/storyTypes";
 
 export type StoryVideoLog = (msg: string) => void;
@@ -98,48 +97,6 @@ async function probeDurationSec(filePath: string): Promise<number> {
 
 const SCALE_CROP_9x16 = `scale=${STORY_WIDTH}:${STORY_HEIGHT}:force_original_aspect_ratio=increase,crop=${STORY_WIDTH}:${STORY_HEIGHT},fps=${VIDEO_FPS},format=yuv420p`;
 
-function cuesToCaptionTokens(cues: SubtitleCue[]): Caption[] {
-  const captions: Caption[] = [];
-  for (const c of cues) {
-    const words = c.text.split(/\s+/).filter(Boolean);
-    if (words.length === 0) continue;
-    const slice = ((c.endSec - c.startSec) * 1000) / words.length;
-    words.forEach((w, i) => {
-      const startMs = Math.round(c.startSec * 1000 + i * slice);
-      const endMs = Math.round(
-        i === words.length - 1 ? c.endSec * 1000 : c.startSec * 1000 + (i + 1) * slice
-      );
-      captions.push({
-        text: (i === 0 ? "" : " ") + w,
-        startMs,
-        endMs,
-        timestampMs: startMs,
-        confidence: 1,
-      });
-    });
-  }
-  return captions;
-}
-
-/** Lock captions to real TTS sentence timings (not Groq (M:SS) guesses). */
-function cuesFromVoiceChunks(chunks: VoiceChunk[]): SubtitleCue[] {
-  let t = 0;
-  return chunks
-    .filter((c) => c.text.trim().length > 0 && c.durationSec > 0)
-    .map((c, i) => {
-      const startSec = t;
-      const endSec = t + c.durationSec;
-      t = endSec;
-      return {
-        index: i + 1,
-        text: c.text.trim(),
-        startSec,
-        endSec,
-        durationSec: Math.max(0.15, endSec - startSec),
-      };
-    });
-}
-
 function weightText(s: string): number {
   const words = s.split(/\s+/).filter(Boolean).length;
   if (words > 0) return words;
@@ -147,17 +104,8 @@ function weightText(s: string): number {
   return Math.max(1, Math.ceil(s.replace(/\s+/g, "").length / 4));
 }
 
-function sceneDurationsForVoice(
-  plan: StoryPlan,
-  cues: SubtitleCue[],
-  voiceSec: number
-): number[] {
-  // Prefer voice-synced cue durations when counts match scenes
-  if (cues.length === plan.scenes.length) {
-    return cues.map((c) => Math.max(0.8, c.durationSec));
-  }
-
-  // Else distribute voice time by each scene's narration mass
+/** Distribute VO duration across scenes by narration weight. */
+function sceneDurationsForVoice(plan: StoryPlan, voiceSec: number): number[] {
   const weights = plan.scenes.map((sc) => weightText(sc.narration || "…"));
   const totalW = weights.reduce((a, b) => a + b, 0) || 1;
   let allocated = 0;
@@ -329,32 +277,28 @@ export async function buildStoryVideo(
       onLog
     );
     const voicePath = voice.path;
-    const voiceSec = await probeDurationSec(voicePath);
-    const chunkSum = voice.chunks.reduce((a, c) => a + c.durationSec, 0);
-    const timeScale = chunkSum > 0.05 ? voiceSec / chunkSum : 1;
-    onLog(
-      `Voice duration: ${voiceSec.toFixed(2)}s (${voice.engine}/${voice.voice}) — caption scale ${timeScale.toFixed(3)}`
-    );
+    const voiceSec = voice.durationSec > 0.05 ? voice.durationSec : await probeDurationSec(voicePath);
+    onLog(`Voice duration: ${voiceSec.toFixed(2)}s (${voice.engine}/${voice.voice})`);
 
-    const cues = cuesFromVoiceChunks(voice.chunks).map((c) => ({
-      ...c,
-      startSec: c.startSec * timeScale,
-      endSec: c.endSec * timeScale,
-      durationSec: Math.max(0.12, c.durationSec * timeScale),
-    }));
-    const captions = cuesToCaptionTokens(cues);
+    const captions = await alignVoiceCaptions({
+      voicePath,
+      lang,
+      narration: plan.fullNarration,
+      durationSec: voiceSec,
+      onLog,
+    });
     const assPath = path.join(workDir, "story.ass");
     await fs.writeFile(
       assPath,
       buildAssFromVoiceCaptions(captions, STORY_WIDTH, STORY_HEIGHT, {
         fontName: lang === "hi" ? "Nirmala UI" : "Arial Black",
-        leadMs: 140,
+        leadMs: 0,
         wordsPerLine: 4,
       }),
       "utf8"
     );
 
-    const sceneDurations = sceneDurationsForVoice(plan, cues, voiceSec);
+    const sceneDurations = sceneDurationsForVoice(plan, voiceSec);
     const clipPaths: string[] = [];
     const poolLabel = poolMeta.map((m) => m.label).join(" + ");
     onLog(
