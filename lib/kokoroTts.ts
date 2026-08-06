@@ -15,6 +15,9 @@ const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 /** Soft char budget for a single Kokoro `generate` call (phoneme / token limit). */
 const KOKORO_ONE_SHOT_MAX_CHARS = 420;
 
+/** Soft char budget for a single Edge TTS request (long payloads get flaky). */
+const EDGE_ONE_SHOT_MAX_CHARS = 420;
+
 export type VoiceChunk = {
   text: string;
   durationSec: number;
@@ -217,9 +220,9 @@ async function synthesizeKokoroEn(
 }
 
 /**
- * Hindi VO via Microsoft Edge online voices.
- * Note: kokoro-js@1.2.1 only ships EN/UK voices (no hf_alpha / hm_omega).
- * Prefer hi-IN-MadhurNeural (male, mystery) — similar role to hm_omega.
+ * Hindi VO via Microsoft Edge online voices — same shape as English Kokoro:
+ * prefer one continuous generate; only split when over the char budget, then stitch.
+ * Captions still come from Whisper on the final WAV (not Edge segment timings).
  */
 async function synthesizeEdgeHi(
   text: string,
@@ -228,38 +231,60 @@ async function synthesizeEdgeHi(
 ): Promise<VoiceResult> {
   const voice = resolveHiEdgeVoice();
   onLog?.(
-    `Hindi VO via Edge TTS (${voice}) — sentence splits → one continuous WAV`
+    `Hindi Edge (${voice}, speed=${resolveSpeed()}) — one continuous WAV…`
   );
 
   const workDir = path.join(path.dirname(outPathWav), `edge-parts-${Date.now()}`);
   await fs.mkdir(workDir, { recursive: true });
-  const parts = splitForTts(text, 260);
-  const partPaths: string[] = [];
 
   try {
     const tts = new MsEdgeTTS();
     await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
     const rate = resolveSpeed();
 
-    for (let i = 0; i < parts.length; i++) {
-      const piece = parts[i]!;
+    const synthesizePiece = async (piece: string, wavDest: string) => {
       const { audioFilePath } = await tts.toFile(workDir, piece, { rate });
-      const wav = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
-      await runFfmpeg(["-y", "-i", audioFilePath, "-ar", "24000", "-ac", "1", wav]);
+      await runFfmpeg([
+        "-y",
+        "-i",
+        audioFilePath,
+        "-ar",
+        "24000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        wavDest,
+      ]);
       try {
         await fs.unlink(audioFilePath);
       } catch {
         /* ignore */
       }
+    };
+
+    if (text.length <= EDGE_ONE_SHOT_MAX_CHARS) {
+      await synthesizePiece(text, outPathWav);
+      onLog?.(`Hindi Edge one-shot generate (${text.length} chars)`);
+    } else {
+      const parts = splitForTts(text, EDGE_ONE_SHOT_MAX_CHARS);
       onLog?.(
-        `  [${i + 1}/${parts.length}] "${piece.slice(0, 40)}${piece.length > 40 ? "…" : ""}"`
+        `Hindi Edge ${parts.length} generate() segment(s) → single continuous WAV`
       );
-      partPaths.push(wav);
+      const partPaths: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        const piece = parts[i]!;
+        const wav = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
+        await synthesizePiece(piece, wav);
+        onLog?.(
+          `  segment ${i + 1}/${parts.length}: "${piece.slice(0, 50)}${piece.length > 50 ? "…" : ""}"`
+        );
+        partPaths.push(wav);
+      }
+      if (partPaths.length === 0) throw new Error("Edge TTS produced no audio.");
+      await concatWavParts(partPaths, outPathWav);
     }
 
-    if (partPaths.length === 0) throw new Error("Edge TTS produced no audio.");
-
-    await concatWavParts(partPaths, outPathWav);
     const durationSec = await probeDurationSec(outPathWav);
     onLog?.(`Hindi Edge VO saved (${durationSec.toFixed(1)}s continuous WAV)`);
     return {
@@ -279,8 +304,9 @@ async function synthesizeEdgeHi(
 }
 
 /**
- * Synthesize story VO. English → kokoro-js. Hindi → Edge (until kokoro-js ships hf_/hm_).
- * Timing for captions comes from Whisper on the final WAV, not TTS chunk probes.
+ * Synthesize story VO.
+ * English → Kokoro · Hindi → Edge (same one-shot / stitch pattern).
+ * Caption timing comes from Whisper on the final WAV for both languages.
  */
 export async function synthesizeStoryVoice(
   text: string,
