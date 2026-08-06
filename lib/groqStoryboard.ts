@@ -1,9 +1,11 @@
 /**
  * Production Groq story planner for faceless YouTube storytelling.
  *
- * Reddit dump → retention-optimized narration plan (JSON) → Kokoro / Edge TTS → FFmpeg / Remotion.
+ * Reddit dump → first-person viral horror narration (JSON) → Kokoro / Edge TTS → FFmpeg.
  *
  * Public API: `planStoryWithGroq(story, lang?)`
+ *
+ * Prompt v2: storyteller-from-memory voice (not summary/screenplay). Schema + normalize/retry/tpm unchanged.
  */
 
 import Groq from "groq-sdk";
@@ -26,7 +28,8 @@ export type { StoryLang } from "@/lib/storyTypes";
 const DEFAULT_MODEL = "llama-3.3-70b-versatile";
 const DEFAULT_TPM_BUDGET = 12_000;
 const DEFAULT_MAX_COMPLETION = 3_500;
-const WORDS_PER_SEC = 2.4; // spoken pace approx for duration estimates
+/** Rough duration estimates in normalize only — not a pacing script for the model. */
+const WORDS_PER_SEC = 2.4;
 
 const EMOTIONS = new Set<StoryEmotion>([
   "fear",
@@ -122,8 +125,9 @@ function fitToTpmBudget(
     return { storyForPrompt: story, maxTokens, truncated: false };
   }
 
+  // CHANGE: truncation hint asks for spoken memory + unanswered ending (not "twist summary")
   return {
-    storyForPrompt: `${story.slice(0, maxChars)}\n\n[INPUT TRUNCATED for API token limits — dramatize retained beats into a complete spoken story with a twist ending.]`,
+    storyForPrompt: `${story.slice(0, maxChars)}\n\n[INPUT TRUNCATED for API token limits — turn retained beats into a complete first-person spoken recollection that escalates danger and ends on one unanswered question.]`,
     maxTokens,
     truncated: true,
   };
@@ -132,106 +136,55 @@ function fitToTpmBudget(
 // ─── Prompt construction ─────────────────────────────────────────────────────
 
 function languageDirective(lang: StoryLang): string {
+  // CHANGE: compressed language rules (~same EN/HI field split, fewer lines)
   if (lang === "hi") {
-    return `LANGUAGE:
-- title, hook, fullNarration, timedTranscript, endingQuestion, every scene.narration → natural Hindi (Devanagari).
-- Spoken horror-YouTube Hindi. Not stiff. Not Latin Hinglish.
-- pexelsQuery, imagePrompt, thumbnailPrompt, hashtags, soundEffect, musicMood enums → English.`;
+    return `LANGUAGE: Spoken fields (title, hook, fullNarration, timedTranscript, endingQuestion, scene.narration) = natural Hindi Devanagari — Shorts speech, not stiff or Latin Hinglish. Visual fields (pexelsQuery, imagePrompt, thumbnailPrompt, hashtags, soundEffect) + enums = English.`;
   }
-  return `LANGUAGE:
-- All spoken fields in natural English.
-- pexelsQuery / imagePrompt always English.`;
+  return `LANGUAGE: Spoken fields = natural spoken English. Visual search/prompts = English.`;
 }
 
+/**
+ * CHANGE: full system-prompt rewrite — first-person storyteller voice; dropped fixed
+ * second-by-second retention curve / trailer / Remotion caption essay; ~30% shorter.
+ * JSON field names kept for normalizeStoryPlan / StoryPlan compatibility.
+ */
 function buildSystemPrompt(lang: StoryLang): string {
-  return `You are the lead writer for a faceless YouTube true-horror channel.
-You adapt raw Reddit / nosleep dumps into SPOKEN narration optimized for Kokoro TTS + Remotion captions.
+  return `You are a horror storyteller speaking from memory — cadence like MrBallen, Mr. Nightmare, Let's Read, Dark Somnium (influence only; never copy wording or branded phrases).
 
-INFLUENCE (pacing only — never copy wording or branded tropes):
-MrBallen · Mr. Nightmare · Let's Read · Dark Somnium · Bedtime Stories.
-Intimate. Measured. Deadly curious.
+Turn raw Reddit / nosleep dumps into first-person SPOKEN Shorts narration. The listener discovers everything WITH you — never hear a summary of what happened.
 
 ${languageDirective(lang)}
 
-═══════════════════════════════════════
-HARD RULES — BREAKING THESE FAILS THE JOB
-═══════════════════════════════════════
+VOICE
+• Always first person ("I…" / "मैं…"). Inside the terror. Never outside narrator.
+• Sound remembered aloud: short sentences, natural pauses, occasional "..."
+• Reveal only what you notice in the moment.
+• Every 1–3 sentences MUST add mystery, danger, contradiction, reveal, or a question. No filler.
+• Soft length ~250–350 spoken words (complete escalation > dumping every Reddit detail).
 
-NEVER summarize the Reddit post.
-NEVER explain the mystery like a lecturer.
-NEVER sound like Wikipedia, ChatGPT, or a movie trailer voice.
-NEVER open with greetings, "this is a story about", or long backstory.
-ALWAYS make the listener think: "What happens next?"
+FORBIDDEN
+"This is the story of" · "I never imagined" · "Little did I know" · "Things were about to get worse" · "The real horror had only begun" · "So this happened" · "I've always believed" · greetings · Wikipedia tone · movie-trailer voice · summarizing the post.
 
-Every 2–3 sentences must land ONE of:
-• mystery · new information · danger · curiosity
-Never let curiosity die.
+HOOK — first sentence of fullNarration
+Instant curiosity. Wrong or impossible fact. No setup.
+Good: "I answered my dead father's phone." / "I woke up covered in mud." / "मैं रोज पड़ोसी के कमरे से चीखें सुनता था।"
+Bad: time/place warmups, "I've always…", "So this begins…"
 
-───────────────────────────────────────
-HOOK (0–5 sec) — FIRST SENTENCE OF NARRATION
-───────────────────────────────────────
-Must be an impossible event. No setup first.
+PACE
+Escalate danger every few lines. Each reveal opens a new question. Never let curiosity drop. No fixed second counts.
 
-Good:
-"I answered my dead father's phone call."
-"I woke up with mud on my shoes… and locked windows."
-"The voicemail was from me. Tomorrow."
+DIALOGUE
+Rare. One short line when it hurts. Beat: He looked at me. "Don't open that door." Then he was gone.
 
-Bad:
-"So this happened at my grandma's house…"
-"I've always been afraid of the upstairs…"
+ENDING
+Never fully explain. Leave one major unanswered question (Part 2 itch). endingQuestion states that itch.
 
-───────────────────────────────────────
-RETENTION CURVE
-───────────────────────────────────────
-0–5s   Impossible hook
-5–15s  Tiny context (where / who) — still tense
-15–30s First concrete impossibility
-30–60s Escalation (closer, louder, more personal)
-60–90s Huge reveal / irreversible beat
-Ending Plot twist that REFRAMES everything before it
-        Leave lingering questions. Never fully explain.
+SCENES
+6–14 logical spoken chunks that concatenate into fullNarration (no repeats, no mini-summaries).
+Each: one narration chunk + emotion + rough durationSec + pexelsQuery (3–6 concrete English words) + imagePrompt (cinematic still, no text/celebrities) + optional captionHighlightWords (1–3) + camera/captionStyle/transition/soundEffect.
+durationSec / startSec are rough only — code will retime.
 
-Length: follow what the story needs for that arc (often ~90–180s spoken). Soft ceiling ~350 words so Kokoro + free-tier APIs stay healthy. Prefer a complete twist over dumping every Reddit detail.
-
-───────────────────────────────────────
-KOKORO / TTS VOICE
-───────────────────────────────────────
-Short spoken sentences: 6–14 words.
-Natural pauses. No paragraph walls.
-Occasional "..." for dramatic breath:
-"I heard footsteps.
-But...
-there was nobody there."
-No academic words. Always sound spoken aloud.
-
-Dialogue: rare, short, natural.
-
-───────────────────────────────────────
-EMOTION
-───────────────────────────────────────
-Every scene has exactly one emotion from:
-fear | regret | shock | curiosity | dread | confusion | loneliness | guilt | panic | awe | unease
-
-───────────────────────────────────────
-VISUALS
-───────────────────────────────────────
-pexelsQuery: 3–6 concrete English search words.
-Bad: forest · house · road
-Good: foggy forest at night · abandoned hospital hallway · rainy windshield at night · empty subway platform · lonely motel room · dark bedroom window · moonlit cemetery · old wooden staircase
-
-imagePrompt: cinematic movie-still description (lighting, lens, mood). No text overlays. No celebrity faces.
-
-───────────────────────────────────────
-CAPTIONS (Remotion)
-───────────────────────────────────────
-scene.narration = one short captionable phrase (not a paragraph).
-captionHighlightWords = 1–3 key words from that phrase.
-captionStyle ∈ center_punch | lower_third | whisper | impact | karaoke
-
-───────────────────────────────────────
-OUTPUT — JSON ONLY (no markdown fences)
-───────────────────────────────────────
+JSON ONLY (no markdown):
 {
   "title": string,
   "hook": string,
@@ -242,34 +195,31 @@ OUTPUT — JSON ONLY (no markdown fences)
   "thumbnailPrompt": string,
   "endingQuestion": string,
   "hashtags": string[],
-  "scenes": [
-    {
-      "narration": string,
-      "startSec": number,
-      "durationSec": number,
-      "emotion": string,
-      "cameraMovement": "static"|"slow_push_in"|"slow_pull_out"|"drift_left"|"drift_right"|"handheld_shake"|"crash_zoom"|"tilt_up"|"tilt_down",
-      "captionStyle": string,
-      "captionHighlightWords": string[],
-      "pexelsQuery": string,
-      "imagePrompt": string,
-      "transition": "cut"|"fade"|"flash"|"glitch"|"whip"|"match_cut",
-      "soundEffect": string
-    }
-  ]
+  "scenes": [{
+    "narration": string,
+    "startSec": number,
+    "durationSec": number,
+    "emotion": "fear"|"regret"|"shock"|"curiosity"|"dread"|"confusion"|"loneliness"|"guilt"|"panic"|"awe"|"unease",
+    "cameraMovement": "static"|"slow_push_in"|"slow_pull_out"|"drift_left"|"drift_right"|"handheld_shake"|"crash_zoom"|"tilt_up"|"tilt_down",
+    "captionStyle": "center_punch"|"lower_third"|"whisper"|"impact"|"karaoke",
+    "captionHighlightWords": string[],
+    "pexelsQuery": string,
+    "imagePrompt": string,
+    "transition": "cut"|"fade"|"flash"|"glitch"|"whip"|"match_cut",
+    "soundEffect": string
+  }]
 }
 
-timedTranscript MUST equal fullNarration with (M:SS) markers before each phrase, matching scenes in order.
-scenes length: 6–16. Sum of durationSec ≈ estimatedDuration.
-endingQuestion leaves a replay-worthy itch.
-hashtags: 5–10 lowercase tags without # prefix.`;
+timedTranscript = fullNarration with (M:SS) before each scene phrase, same order as scenes.
+hashtags: 5–10 lowercase, no #. hook = first spoken sentence.`;
 }
 
 function buildUserPrompt(lang: StoryLang, storyBody: string): string {
+  // CHANGE: user brief matches storyteller rules (no fixed retention-curve jargon)
   const langLabel = lang === "hi" ? "Hindi Devanagari" : "English";
-  return `Rewrite this raw dump into a ${langLabel} spoken horror narration plan (JSON only).
+  return `Rewrite this raw dump as a ${langLabel} first-person spoken horror recollection (JSON only).
 
-Rules reminder: impossible hook first. No summary. Retention curve. Twist ending that reframes everything. Kokoro-friendly short sentences.
+Hook in sentence one. Never summarize. Escalate mystery/danger. End unexplained with one burning question. Short spoken lines.
 
 RAW STORY:
 ---
@@ -461,13 +411,20 @@ type SceneDraft = {
   soundEffect?: unknown;
 };
 
+/**
+ * Retimes scenes from spoken length; model durationSec is a rough hint only.
+ * CHANGE: clamps wild model durations toward word-estimate so Shorts timing stays sane
+ * without forcing the prompt to prescribe exact second counts.
+ */
 function retimeScenes(scenes: SceneDraft[]): StoryScene[] {
   let t = 0;
   return scenes.map((raw, i) => {
     const narration = String(raw.narration ?? "").trim();
+    const fromWords = estimateSpokenSec(narration);
+    const fromModel = Number(raw.durationSec);
     const durationSec = Math.max(
       1.2,
-      Number(raw.durationSec) > 0 ? Number(raw.durationSec) : estimateSpokenSec(narration)
+      fromModel > 0 ? Math.min(fromModel, fromWords * 1.35) : fromWords
     );
     const startSec = t;
     t += durationSec;
@@ -574,9 +531,10 @@ export function normalizeStoryPlan(raw: unknown): StoryPlan {
     thumbnailPrompt:
       String(o.thumbnailPrompt ?? "").trim() ||
       `Cinematic horror thumbnail: ${scenes[0]?.pexelsQuery ?? "dark hallway"}, high contrast, no text`,
+    // CHANGE: Part-2 itch default (not generic "what would you have done")
     endingQuestion:
       String(o.endingQuestion ?? "").trim() ||
-      "What would you have done if you were next?",
+      "And if it happens again tonight… who opens the door first?",
     hashtags: normalizeHashtags(o.hashtags),
     scenes,
   };
@@ -597,7 +555,7 @@ function assertPlanQuality(plan: StoryPlan): void {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Plan a retention-optimized spoken horror story from a raw Reddit-style dump.
+ * Plan a first-person spoken horror story from a raw Reddit-style dump.
  * Retries once if JSON is unusable; auto-repairs timings and missing fields.
  */
 export async function planStoryWithGroq(
@@ -624,12 +582,13 @@ export async function planStoryWithGroq(
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const temperature = attempt === 1 ? 0.72 : 0.35;
+      // CHANGE: warmer first pass for spoken voice; cooler retry for valid JSON
+      const temperature = attempt === 1 ? 0.78 : 0.35;
       const completionUser =
         attempt === 1
           ? user
           : `${user}\n\nPREVIOUS OUTPUT WAS INVALID JSON OR FAILED VALIDATION.
-Return ONLY a complete valid JSON object matching the schema. No markdown. No commentary.`;
+Return ONLY a complete valid JSON object matching the schema. No markdown. No commentary. First-person spoken voice only.`;
 
       const rawText = await callGroqOnce({
         client,

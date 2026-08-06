@@ -120,14 +120,15 @@ export function buildAssFromVoiceCaptions(
   opts?: { fontName?: string; leadMs?: number; wordsPerLine?: number }
 ): string {
   const vertical = playResY > playResX;
-  const fontSize = vertical ? 52 : 64;
-  const marginLR = vertical ? 44 : 100;
-  const marginV = vertical ? 320 : 70;
+  // Shorts need large karaoke text — was 52/64 and read tiny on phone
+  const fontSize = vertical ? 84 : 78;
+  const marginLR = vertical ? 36 : 100;
+  const marginV = vertical ? 340 : 70;
   const alignment = vertical ? 2 : 5;
   const anTag = vertical ? "\\an2" : "\\an5";
   const fontName = (opts?.fontName || "Arial Black").replace(/,/g, "");
   const leadMs = opts?.leadMs ?? 0;
-  const wordsPerLine = Math.max(2, opts?.wordsPerLine ?? (vertical ? 4 : 5));
+  const wordsPerLine = Math.max(2, opts?.wordsPerLine ?? (vertical ? 3 : 5));
 
   const tokens = captions
     .map((c) => ({
@@ -164,7 +165,7 @@ export function buildAssFromVoiceCaptions(
         .join("");
 
       events.push(
-        `Dialogue: 0,${secToAssTime(sliceStart / 1000)},${secToAssTime(sliceEnd / 1000)},TikTok,,0,0,0,,{${anTag}\\bord6\\shad1\\q2}${line}`
+        `Dialogue: 0,${secToAssTime(sliceStart / 1000)},${secToAssTime(sliceEnd / 1000)},TikTok,,0,0,0,,{${anTag}\\bord8\\shad2\\q2}${line}`
       );
     }
   }

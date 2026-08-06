@@ -293,7 +293,7 @@ export async function buildStoryVideo(
       buildAssFromVoiceCaptions(captions, STORY_WIDTH, STORY_HEIGHT, {
         fontName: lang === "hi" ? "Nirmala UI" : "Arial Black",
         leadMs: 0,
-        wordsPerLine: 4,
+        wordsPerLine: 3,
       }),
       "utf8"
     );
