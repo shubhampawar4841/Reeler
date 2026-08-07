@@ -120,7 +120,7 @@ export async function POST(req: Request) {
 
     push(`Story received (${story.length} chars, lang=${lang})`);
     if (!backgroundVideoPath) {
-      push("Using built-in Minecraft parkour B-roll (public/…Vertical.mp4)");
+      push("Using Supabase Minecraft parkour B-roll");
     }
     const result = await buildStoryVideo({
       story,
@@ -137,8 +137,9 @@ export async function POST(req: Request) {
       usedUpload: result.usedUpload,
       brollSource: result.brollSource,
       lang: result.lang,
+      renderer: result.renderer,
       logs,
-      message: `Story Short ready (B-roll: ${result.brollSource}).`,
+      message: `Story Short ready (${result.renderer}, B-roll: ${result.brollSource}).`,
     });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);

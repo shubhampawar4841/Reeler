@@ -4,7 +4,10 @@ const nextConfig: NextConfig = {
   // Keep native addons / CLI wrappers external so paths resolve at runtime
   serverExternalPackages: [
     "@huggingface/transformers",
+    "@remotion/bundler",
     "@remotion/captions",
+    "@remotion/renderer",
+    "remotion",
     "ffmpeg-static",
     "fluent-ffmpeg",
     "groq-sdk",

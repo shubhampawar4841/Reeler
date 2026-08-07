@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { v4 as uuidv4 } from "uuid";
+import type { Caption } from "@remotion/captions";
 import { getFfmpegExecutable } from "@/lib/binPaths";
 import { VIDEO_FPS } from "@/lib/ffmpeg";
 import { buildAssFromVoiceCaptions } from "@/lib/dummyCaptions";
@@ -10,6 +11,11 @@ import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
 import { synthesizeStoryVoice } from "@/lib/kokoroTts";
 import { alignVoiceCaptions } from "@/lib/alignVoiceCaptions";
 import type { StoryPlan, StoryScene } from "@/lib/storyTypes";
+import { getStoryRendererMode } from "@/lib/remotion/renderStory";
+import {
+  mapPipelineToInput,
+  type BrollPoolItem,
+} from "@/lib/remotion/mapPipelineToInput";
 
 export type StoryVideoLog = (msg: string) => void;
 
@@ -29,6 +35,22 @@ export type BuildStoryVideoOptions = {
   /** Optional local override; otherwise downloads DEFAULT_STORY_BROLL_URLS */
   backgroundVideoPath?: string | null;
   onLog?: StoryVideoLog;
+};
+
+type PreparedStoryAssets = {
+  jobId: string;
+  workDir: string;
+  outDir: string;
+  outPath: string;
+  plan: StoryPlan;
+  voicePath: string;
+  voiceSec: number;
+  captions: Caption[];
+  poolMeta: BrollPoolItem[];
+  sceneDurations: number[];
+  usedUpload: boolean;
+  poolLabel: string;
+  lang: StoryLang;
 };
 
 async function downloadBrollUrl(
@@ -100,7 +122,6 @@ const SCALE_CROP_9x16 = `scale=${STORY_WIDTH}:${STORY_HEIGHT}:force_original_asp
 function weightText(s: string): number {
   const words = s.split(/\s+/).filter(Boolean).length;
   if (words > 0) return words;
-  // Devanagari fallback: approx syllables by char clusters
   return Math.max(1, Math.ceil(s.replace(/\s+/g, "").length / 4));
 }
 
@@ -150,11 +171,6 @@ async function trimClip(
   );
 }
 
-/**
- * Cut `durationSec` from a random place in a (possibly long) source.
- * Output length == durationSec only — never pads past the VO beat.
- * If source is shorter than needed, loops the file until the beat is filled.
- */
 async function cutRandomSegment(
   src: string,
   dest: string,
@@ -174,7 +190,6 @@ async function cutRandomSegment(
     return;
   }
 
-  // Short source: loop then trim exact length
   onLog?.(
     `  source shorter than beat (${srcDurationSec.toFixed(1)}s < ${need.toFixed(1)}s) — looping`
   );
@@ -204,19 +219,12 @@ async function cutRandomSegment(
 }
 
 /**
- * Story → Groq plan → Minecraft parkour B-roll (or override) → VO → captioned 9:16 MP4.
- * Only the final story.mp4 is written under public/output (no plan/captions JSON junk).
+ * Shared prep: B-roll download, Groq plan, TTS, Whisper captions.
+ * Rendering (FFmpeg vs Remotion) happens after this.
  */
-export async function buildStoryVideo(
+async function prepareStoryAssets(
   options: BuildStoryVideoOptions
-): Promise<{
-  videoUrl: string;
-  plan: StoryPlan;
-  durationSec: number;
-  usedUpload: boolean;
-  lang: StoryLang;
-  brollSource: string;
-}> {
+): Promise<PreparedStoryAssets> {
   const { story, lang = "en", onLog = console.log } = options;
   const jobId = uuidv4();
   const workDir = path.join(os.tmpdir(), "reeler-story", jobId);
@@ -228,109 +236,231 @@ export async function buildStoryVideo(
   const uploadPath = options.backgroundVideoPath?.trim() || "";
   const usedUpload = Boolean(uploadPath);
 
-  try {
-    const poolMeta: { path: string; dur: number; label: string }[] = [];
-    if (usedUpload) {
+  const poolMeta: BrollPoolItem[] = [];
+  if (usedUpload) {
+    try {
+      await fs.access(uploadPath);
+      poolMeta.push({
+        path: uploadPath,
+        dur: await probeDurationSec(uploadPath),
+        label: path.basename(uploadPath),
+      });
+    } catch {
+      throw new Error(`B-roll upload missing: ${uploadPath}`);
+    }
+  } else {
+    for (let i = 0; i < DEFAULT_STORY_BROLL_URLS.length; i++) {
+      const url = DEFAULT_STORY_BROLL_URLS[i]!;
+      const dest = path.join(workDir, `broll-${i + 1}.mp4`);
       try {
-        await fs.access(uploadPath);
+        await downloadBrollUrl(url, dest, onLog);
         poolMeta.push({
-          path: uploadPath,
-          dur: await probeDurationSec(uploadPath),
-          label: path.basename(uploadPath),
+          path: dest,
+          dur: await probeDurationSec(dest),
+          label: path.basename(new URL(url).pathname),
         });
-      } catch {
-        throw new Error(`B-roll upload missing: ${uploadPath}`);
-      }
-    } else {
-      for (let i = 0; i < DEFAULT_STORY_BROLL_URLS.length; i++) {
-        const url = DEFAULT_STORY_BROLL_URLS[i]!;
-        const dest = path.join(workDir, `broll-${i + 1}.mp4`);
-        try {
-          await downloadBrollUrl(url, dest, onLog);
-          poolMeta.push({
-            path: dest,
-            dur: await probeDurationSec(dest),
-            label: path.basename(new URL(url).pathname),
-          });
-        } catch (err) {
-          onLog?.(
-            `Skipping B-roll part ${i + 1}: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-      }
-      if (poolMeta.length === 0) {
-        throw new Error(
-          "Failed to download B-roll from Supabase. Check DEFAULT_STORY_BROLL_URLS."
+      } catch (err) {
+        onLog?.(
+          `Skipping B-roll part ${i + 1}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }
+    if (poolMeta.length === 0) {
+      throw new Error(
+        "Failed to download B-roll from Supabase. Check DEFAULT_STORY_BROLL_URLS."
+      );
+    }
+  }
 
-    onLog(`Planning storyboard with Groq (${lang === "hi" ? "Hindi" : "English"})…`);
-    const plan = await planStoryWithGroq(story, lang);
-    onLog(`Plan ready: "${plan.title}" · ${plan.scenes.length} scene(s)`);
+  onLog(`Planning storyboard with Groq (${lang === "hi" ? "Hindi" : "English"})…`);
+  const plan = await planStoryWithGroq(story, lang);
+  onLog(`Plan ready: "${plan.title}" · ${plan.scenes.length} scene(s)`);
 
-    onLog(lang === "hi" ? "Synthesizing Hindi voice-over…" : "Synthesizing English Kokoro voice-over…");
-    const voice = await synthesizeStoryVoice(
-      plan.fullNarration,
-      path.join(workDir, "voice"),
-      lang,
-      onLog
+  onLog(
+    lang === "hi"
+      ? "Synthesizing Hindi voice-over…"
+      : "Synthesizing English Kokoro voice-over…"
+  );
+  const voice = await synthesizeStoryVoice(
+    plan.fullNarration,
+    path.join(workDir, "voice"),
+    lang,
+    onLog
+  );
+  const voicePath = voice.path;
+  const voiceSec =
+    voice.durationSec > 0.05 ? voice.durationSec : await probeDurationSec(voicePath);
+  onLog(`Voice duration: ${voiceSec.toFixed(2)}s (${voice.engine}/${voice.voice})`);
+
+  const captions = await alignVoiceCaptions({
+    voicePath,
+    lang,
+    narration: plan.fullNarration,
+    durationSec: voiceSec,
+    onLog,
+  });
+
+  const sceneDurations = sceneDurationsForVoice(plan, voiceSec);
+  const poolLabel = poolMeta.map((m) => m.label).join(" + ");
+
+  return {
+    jobId,
+    workDir,
+    outDir,
+    outPath,
+    plan,
+    voicePath,
+    voiceSec,
+    captions,
+    poolMeta,
+    sceneDurations,
+    usedUpload,
+    poolLabel,
+    lang,
+  };
+}
+
+async function renderWithFfmpeg(
+  prepared: PreparedStoryAssets,
+  onLog: StoryVideoLog
+): Promise<void> {
+  const {
+    workDir,
+    outPath,
+    plan,
+    voicePath,
+    voiceSec,
+    captions,
+    poolMeta,
+    sceneDurations,
+    poolLabel,
+    lang,
+  } = prepared;
+
+  const assPath = path.join(workDir, "story.ass");
+  await fs.writeFile(
+    assPath,
+    buildAssFromVoiceCaptions(captions, STORY_WIDTH, STORY_HEIGHT, {
+      fontName: lang === "hi" ? "Nirmala UI" : "Arial Black",
+      leadMs: 0,
+      wordsPerLine: 3,
+    }),
+    "utf8"
+  );
+
+  const clipPaths: string[] = [];
+  onLog(
+    `B-roll: ${poolLabel} — FFmpeg random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
+  );
+  for (let i = 0; i < plan.scenes.length; i++) {
+    const d = sceneDurations[i]!;
+    const clipPath = path.join(workDir, `clip-${i}.mp4`);
+    const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
+    onLog(`Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${src.label}`);
+    await cutRandomSegment(src.path, clipPath, d, src.dur, onLog);
+    clipPaths.push(clipPath);
+  }
+
+  onLog("Concatenating clips + voice + captions (FFmpeg 9:16)…");
+  await concatClipsWithVoice(clipPaths, voicePath, assPath, outPath, voiceSec, onLog);
+}
+
+async function renderWithRemotion(
+  prepared: PreparedStoryAssets,
+  onLog: StoryVideoLog
+): Promise<number> {
+  const { renderStoryShort } = await import("@/lib/remotion/renderStory");
+  const { cleanupRemotionAssets } = await import(
+    "@/lib/remotion/mapPipelineToInput"
+  );
+  // Intro/outro ON by default (Phase 3). Disable with STORY_REMOTION_INTRO=0
+  const introEnv = (process.env.STORY_REMOTION_INTRO || "").trim();
+  const enableIntroOutro = introEnv !== "0" && introEnv.toLowerCase() !== "false";
+
+  const input = await mapPipelineToInput({
+    jobId: prepared.jobId,
+    outDir: prepared.outDir,
+    plan: prepared.plan,
+    voicePath: prepared.voicePath,
+    voiceSec: prepared.voiceSec,
+    captions: prepared.captions,
+    poolMeta: prepared.poolMeta,
+    sceneDurations: prepared.sceneDurations,
+    lang: prepared.lang,
+    enableIntroOutro,
+    onLog,
+  });
+
+  onLog(
+    `B-roll: ${prepared.poolLabel} — Remotion cinema (${input.sceneSchedule.length} scenes, intro/outro=${enableIntroOutro})`
+  );
+  for (const sc of input.sceneSchedule) {
+    onLog(
+      `  Scene ${sc.sceneIndex + 1}: frames ${sc.startFrame}-${sc.endFrame} @ ${sc.clipStartSec.toFixed(1)}s trim`
     );
-    const voicePath = voice.path;
-    const voiceSec = voice.durationSec > 0.05 ? voice.durationSec : await probeDurationSec(voicePath);
-    onLog(`Voice duration: ${voiceSec.toFixed(2)}s (${voice.engine}/${voice.voice})`);
+  }
 
-    const captions = await alignVoiceCaptions({
-      voicePath,
-      lang,
-      narration: plan.fullNarration,
-      durationSec: voiceSec,
+  try {
+    const { durationInFrames } = await renderStoryShort({
+      input,
+      outPath: prepared.outPath,
       onLog,
     });
-    const assPath = path.join(workDir, "story.ass");
-    await fs.writeFile(
-      assPath,
-      buildAssFromVoiceCaptions(captions, STORY_WIDTH, STORY_HEIGHT, {
-        fontName: lang === "hi" ? "Nirmala UI" : "Arial Black",
-        leadMs: 0,
-        wordsPerLine: 3,
-      }),
-      "utf8"
-    );
+    return durationInFrames / (input.fps || 30);
+  } finally {
+    // Drop staging media; keep story.mp4 only
+    await cleanupRemotionAssets(prepared.outDir);
+  }
+}
 
-    const sceneDurations = sceneDurationsForVoice(plan, voiceSec);
-    const clipPaths: string[] = [];
-    const poolLabel = poolMeta.map((m) => m.label).join(" + ");
-    onLog(
-      `B-roll: ${poolLabel} — random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
-    );
-    for (let i = 0; i < plan.scenes.length; i++) {
-      const d = sceneDurations[i]!;
-      const clipPath = path.join(workDir, `clip-${i}.mp4`);
-      const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
-      onLog(
-        `Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${src.label}`
-      );
-      await cutRandomSegment(src.path, clipPath, d, src.dur, onLog);
-      clipPaths.push(clipPath);
+/**
+ * Story → Groq plan → B-roll → VO → Whisper → FFmpeg or Remotion 9:16 MP4.
+ * Only the final story.mp4 is written under public/output.
+ * Switch with STORY_RENDERER=ffmpeg|remotion (default ffmpeg).
+ */
+export async function buildStoryVideo(
+  options: BuildStoryVideoOptions
+): Promise<{
+  videoUrl: string;
+  plan: StoryPlan;
+  durationSec: number;
+  usedUpload: boolean;
+  lang: StoryLang;
+  brollSource: string;
+  renderer: "ffmpeg" | "remotion";
+}> {
+  const { onLog = console.log } = options;
+  const rendererMode = getStoryRendererMode();
+  onLog(`Story renderer: ${rendererMode}`);
+
+  let prepared: PreparedStoryAssets | null = null;
+
+  try {
+    prepared = await prepareStoryAssets(options);
+    let durationSec = prepared.voiceSec;
+
+    if (rendererMode === "remotion") {
+      durationSec = await renderWithRemotion(prepared, onLog);
+    } else {
+      await renderWithFfmpeg(prepared, onLog);
     }
 
-    onLog("Concatenating clips + voice + captions (9:16)…");
-    await concatClipsWithVoice(clipPaths, voicePath, assPath, outPath, voiceSec, onLog);
-
     return {
-      videoUrl: `/output/${jobId}/story.mp4`,
-      plan,
-      durationSec: voiceSec,
-      usedUpload,
-      lang,
-      brollSource: poolLabel,
+      videoUrl: `/output/${prepared.jobId}/story.mp4`,
+      plan: prepared.plan,
+      durationSec,
+      usedUpload: prepared.usedUpload,
+      lang: prepared.lang,
+      brollSource: prepared.poolLabel,
+      renderer: rendererMode,
     };
   } finally {
-    try {
-      await fs.rm(workDir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+    if (prepared?.workDir) {
+      try {
+        await fs.rm(prepared.workDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
     }
   }
 }
@@ -351,7 +481,6 @@ async function concatClipsWithVoice(
   args.push("-i", voicePath);
 
   const labels = clipPaths.map((_, i) => `[${i}:v]`).join("");
-  // Keep audio timeline from 0 (no asetpts reset that can desync burned captions)
   const filter = [
     `${labels}concat=n=${n}:v=1:a=0[vcat]`,
     `[vcat]ass='${escapePathForFilter(assPath)}'[vout]`,

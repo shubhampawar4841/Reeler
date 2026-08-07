@@ -30,9 +30,9 @@ async function main() {
   const workDir = path.join(os.tmpdir(), `reeler-smoke-align-${Date.now()}`);
   await fsp.mkdir(workDir, { recursive: true });
 
-  const { synthesizeStoryVoice } = await import("../lib/kokoroTts.ts");
-  const { alignVoiceCaptions } = await import("../lib/alignVoiceCaptions.ts");
-  const { buildAssFromVoiceCaptions } = await import("../lib/dummyCaptions.ts");
+  const { synthesizeStoryVoice } = await import("../lib/kokoroTts");
+  const { alignVoiceCaptions } = await import("../lib/alignVoiceCaptions");
+  const { buildAssFromVoiceCaptions } = await import("../lib/dummyCaptions");
 
   const narration =
     "Someone left the door unlocked. That should not matter. Unless something was waiting inside.";
