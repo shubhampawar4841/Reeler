@@ -23,10 +23,65 @@ export type StoryVideoLog = (msg: string) => void;
 export const STORY_WIDTH = 1080;
 export const STORY_HEIGHT = 1920;
 
-/** Remote parkour B-roll (downloaded into the job temp dir each run). */
+/**
+ * Single final encode only (no intermediate H.264 passes).
+ * Target ~20–25MB / 60s @ 1080x1920 / 30fps (≈2.7–3.3 Mbps).
+ */
+const ENCODE_PRESET = "slow";
+const ENCODE_CRF = "29";
+const ENCODE_MAXRATE = "3.5M";
+const ENCODE_BUFSIZE = "7M";
+const ENCODE_AUDIO_BITRATE = "64k";
+
+/**
+ * Whole Short playback speed (B-roll + VO + captions together).
+ * Env: STORY_SPEED (1–2). Default 1.35.
+ */
+function resolvePlaybackSpeed(): number {
+  const raw = Number(process.env.STORY_SPEED ?? process.env.BROLL_SPEED);
+  if (Number.isFinite(raw) && raw >= 1 && raw <= 2) return raw;
+  return 1.35;
+}
+
+/** atempo only accepts 0.5–2.0 per filter; chain for safety. */
+function atempoFilterChain(speed: number): string {
+  const parts: string[] = [];
+  let remaining = speed;
+  while (remaining > 2.0 + 1e-6) {
+    parts.push("atempo=2.0");
+    remaining /= 2;
+  }
+  while (remaining < 0.5 - 1e-6) {
+    parts.push("atempo=0.5");
+    remaining /= 0.5;
+  }
+  parts.push(`atempo=${remaining.toFixed(4)}`);
+  return parts.join(",");
+}
+
+/** Scale Whisper caption timestamps so they stay locked after atempo speedup. */
+function scaleCaptionsForSpeed(captions: Caption[], speed: number): Caption[] {
+  if (speed === 1) return captions;
+  return captions.map((c) => ({
+    ...c,
+    startMs: Math.round(c.startMs / speed),
+    endMs: Math.max(
+      Math.round(c.startMs / speed) + 30,
+      Math.round(c.endMs / speed)
+    ),
+    timestampMs:
+      typeof c.timestampMs === "number"
+        ? Math.round(c.timestampMs / speed)
+        : c.timestampMs,
+  }));
+}
+
+/** Remote B-roll (downloaded into the job temp dir each run). */
 export const DEFAULT_STORY_BROLL_URLS = [
-  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-1.mp4",
-  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-2.mp4",
+  // "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-1.mp4",
+  // "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-2.mp4",
+  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/(No%20Copyright)Satisfying%20Videos%20Reel_Shorts%20format%20Satisfying%20Videos%20for%20Repost%20-%20Killing%20tech%20(480p,%20h264)%20(1).mp4",
+  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/(No%20Copyright)Satisfying%20Videos%20Reel_Shorts%20format%20Satisfying%20Videos%20for%20Repost%20-%20Killing%20tech%20(480p,%20h264).mp4",
 ] as const;
 
 export type BuildStoryVideoOptions = {
@@ -74,32 +129,55 @@ function escapePathForFilter(p: string): string {
     .replace(/'/g, "\\'");
 }
 
-function runFfmpeg(args: string[], onLog?: StoryVideoLog): Promise<void> {
+function runFfmpeg(
+  args: string[],
+  onLog?: StoryVideoLog
+): Promise<{ stderr: string }> {
   return new Promise((resolve, reject) => {
+    let stderr = "";
     const ff = execFile(
       getFfmpegExecutable(),
       args,
       { maxBuffer: 80 * 1024 * 1024, windowsHide: true },
-      (err, _stdout, stderr) => {
+      (err, _stdout, e) => {
+        const text = typeof e === "string" ? e : stderr;
         if (err) {
-          const msg =
-            typeof stderr === "string" && stderr.trim()
-              ? stderr.slice(-2500)
-              : err.message;
+          const msg = text.trim() ? text.slice(-2500) : err.message;
           reject(new Error(`ffmpeg failed: ${msg}`));
           return;
         }
-        resolve();
+        resolve({ stderr: text });
       }
     );
     ff.stderr?.on("data", (d: Buffer) => {
-      const line = d.toString("utf8").trim();
-      if (line && onLog && /time=|error|Error/.test(line)) onLog(line.slice(0, 200));
+      const chunk = d.toString("utf8");
+      stderr += chunk;
+      const line = chunk.trim();
+      if (line && onLog && /time=|error|Error/.test(line)) {
+        onLog(line.slice(0, 200));
+      }
     });
   });
 }
 
-async function probeDurationSec(filePath: string): Promise<number> {
+function parseDurationFromProbe(stderr: string): number | null {
+  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
+  if (!m) return null;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+/** Last `bitrate:` from FFmpeg progress / summary (kbits/s). */
+function parseBitrateKbps(stderr: string): number | null {
+  const matches = [...stderr.matchAll(/bitrate=\s*([\d.]+)\s*kbits\/s/gi)];
+  if (matches.length === 0) return null;
+  const last = matches[matches.length - 1]![1];
+  const n = Number(last);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function probeMedia(
+  filePath: string
+): Promise<{ durationSec: number; bitrateKbps: number | null; sizeBytes: number }> {
   const stderr = await new Promise<string>((resolve, reject) => {
     execFile(
       getFfmpegExecutable(),
@@ -112,12 +190,40 @@ async function probeDurationSec(filePath: string): Promise<number> {
       }
     );
   });
-  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
-  if (!m) throw new Error(`No Duration for ${path.basename(filePath)}`);
-  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  const durationSec = parseDurationFromProbe(stderr);
+  if (durationSec == null) {
+    throw new Error(`No Duration for ${path.basename(filePath)}`);
+  }
+  const stat = await fs.stat(filePath);
+  const fromContainer = stderr.match(/bitrate:\s*([\d.]+)\s*kb\/s/i);
+  const bitrateKbps = fromContainer
+    ? Number(fromContainer[1])
+    : durationSec > 0
+      ? (stat.size * 8) / durationSec / 1000
+      : null;
+  return {
+    durationSec,
+    bitrateKbps:
+      bitrateKbps != null && Number.isFinite(bitrateKbps) ? bitrateKbps : null,
+    sizeBytes: stat.size,
+  };
 }
 
-const SCALE_CROP_9x16 = `scale=${STORY_WIDTH}:${STORY_HEIGHT}:force_original_aspect_ratio=increase,crop=${STORY_WIDTH}:${STORY_HEIGHT},fps=${VIDEO_FPS},format=yuv420p`;
+async function probeDurationSec(filePath: string): Promise<number> {
+  const { durationSec } = await probeMedia(filePath);
+  return durationSec;
+}
+
+function formatMb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+}
+
+function avgBitrateKbps(sizeBytes: number, durationSec: number): number {
+  if (durationSec <= 0) return 0;
+  return (sizeBytes * 8) / durationSec / 1000;
+}
+
+const SCALE_CROP_9x16 = `scale=${STORY_WIDTH}:${STORY_HEIGHT}:force_original_aspect_ratio=increase,crop=${STORY_WIDTH}:${STORY_HEIGHT},format=yuv420p`;
 
 function weightText(s: string): number {
   const words = s.split(/\s+/).filter(Boolean).length;
@@ -139,83 +245,135 @@ function sceneDurationsForVoice(plan: StoryPlan, voiceSec: number): number[] {
   });
 }
 
-async function trimClip(
-  src: string,
-  dest: string,
-  durationSec: number,
-  onLog?: StoryVideoLog,
-  startSec = 0
-): Promise<void> {
-  await runFfmpeg(
-    [
-      "-y",
-      "-hide_banner",
-      "-ss",
-      Math.max(0, startSec).toFixed(3),
-      "-t",
-      durationSec.toFixed(3),
-      "-i",
-      src,
-      "-vf",
-      SCALE_CROP_9x16,
-      "-an",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "22",
-      dest,
-    ],
-    onLog
-  );
-}
+/**
+ * One FFmpeg pass: trim + scale/crop + overall speed (video+audio) + ASS → story.mp4.
+ * Speeds the whole Short (B-roll AND speech) so both feel fast and stay in sync.
+ */
+async function encodeStoryOnePass(args: {
+  brollPath: string;
+  brollDurSec: number;
+  voicePath: string;
+  assPath: string;
+  outPath: string;
+  voiceSec: number;
+  playbackSpeed: number;
+  onLog: StoryVideoLog;
+}): Promise<number> {
+  const {
+    brollPath,
+    brollDurSec,
+    voicePath,
+    assPath,
+    outPath,
+    voiceSec,
+    playbackSpeed: speed,
+    onLog,
+  } = args;
 
-async function cutRandomSegment(
-  src: string,
-  dest: string,
-  durationSec: number,
-  srcDurationSec: number,
-  onLog?: StoryVideoLog
-): Promise<void> {
-  const need = Math.max(0.2, durationSec);
+  const voiceIn = Math.max(0.2, voiceSec);
+  const outDur = voiceIn / speed;
+  // Consume speed× source so after setpts it matches outDur.
+  const sourceNeed = voiceIn;
+  const canTrim = brollDurSec >= sourceNeed + 0.05;
+  const startSec = canTrim ? Math.random() * (brollDurSec - sourceNeed) : 0;
 
-  if (srcDurationSec >= need + 0.05) {
-    const maxStart = srcDurationSec - need;
-    const start = Math.random() * maxStart;
-    onLog?.(
-      `  random cut ${need.toFixed(1)}s @ ${start.toFixed(1)}s / ${srcDurationSec.toFixed(0)}s source`
+  if (canTrim) {
+    onLog(
+      `One-pass encode: ${sourceNeed.toFixed(1)}s B-roll @ ${startSec.toFixed(1)}s + VO → ${speed}× overall → ${outDur.toFixed(1)}s Short`
     );
-    await trimClip(src, dest, need, onLog, start);
-    return;
+  } else {
+    onLog(
+      `One-pass encode: loop B-roll + VO → ${speed}× overall → ${outDur.toFixed(1)}s Short`
+    );
   }
 
-  onLog?.(
-    `  source shorter than beat (${srcDurationSec.toFixed(1)}s < ${need.toFixed(1)}s) — looping`
+  const srcProbe = await probeMedia(brollPath);
+  onLog(
+    `Encode BEFORE (source B-roll): size=${formatMb(srcProbe.sizeBytes)}, ` +
+      `dur=${srcProbe.durationSec.toFixed(1)}s, ` +
+      `avgBitrate=${srcProbe.bitrateKbps != null ? `${srcProbe.bitrateKbps.toFixed(0)} kbps` : "n/a"}`
   );
-  await runFfmpeg(
-    [
-      "-y",
-      "-hide_banner",
-      "-stream_loop",
-      "-1",
-      "-i",
-      src,
+  onLog(
+    `Encode settings: preset=${ENCODE_PRESET} crf=${ENCODE_CRF} maxrate=${ENCODE_MAXRATE} ` +
+      `bufsize=${ENCODE_BUFSIZE} aac=${ENCODE_AUDIO_BITRATE} storySpeed=${speed}× (B-roll+speech+captions)`
+  );
+
+  const filter = [
+    `[0:v]${SCALE_CROP_9x16},setpts=PTS/${speed},fps=${VIDEO_FPS},ass='${escapePathForFilter(assPath)}'[vout]`,
+    `[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo,${atempoFilterChain(speed)}[aout]`,
+  ].join(";");
+
+  const ffArgs: string[] = ["-y", "-hide_banner"];
+  if (canTrim) {
+    ffArgs.push(
+      "-ss",
+      startSec.toFixed(3),
       "-t",
-      need.toFixed(3),
-      "-vf",
-      SCALE_CROP_9x16,
-      "-an",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "22",
-      dest,
-    ],
-    onLog
+      sourceNeed.toFixed(3),
+      "-i",
+      brollPath
+    );
+  } else {
+    ffArgs.push("-stream_loop", "-1", "-i", brollPath);
+  }
+  ffArgs.push(
+    "-i",
+    voicePath,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[vout]",
+    "-map",
+    "[aout]",
+    "-c:v",
+    "libx264",
+    "-preset",
+    ENCODE_PRESET,
+    "-crf",
+    ENCODE_CRF,
+    "-maxrate",
+    ENCODE_MAXRATE,
+    "-bufsize",
+    ENCODE_BUFSIZE,
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    String(VIDEO_FPS),
+    "-c:a",
+    "aac",
+    "-b:a",
+    ENCODE_AUDIO_BITRATE,
+    "-t",
+    outDur.toFixed(3),
+    "-movflags",
+    "+faststart",
+    outPath
   );
+
+  const t0 = performance.now();
+  const { stderr } = await runFfmpeg(ffArgs, onLog);
+  const encodeMs = performance.now() - t0;
+
+  const out = await probeMedia(outPath);
+  const avgKbps = avgBitrateKbps(out.sizeBytes, out.durationSec || outDur);
+  const progressKbps = parseBitrateKbps(stderr);
+
+  onLog(
+    `Encode AFTER (story.mp4): size=${formatMb(out.sizeBytes)}, ` +
+      `dur=${out.durationSec.toFixed(1)}s, ` +
+      `avgBitrate=${avgKbps.toFixed(0)} kbps` +
+      (progressKbps != null ? ` (ffmpeg last=${progressKbps.toFixed(0)} kbps)` : "") +
+      `, encodeTime=${(encodeMs / 1000).toFixed(1)}s`
+  );
+
+  const perMinMb =
+    (out.sizeBytes / (1024 * 1024)) * (60 / Math.max(1, out.durationSec));
+  onLog(
+    `Size check: ~${perMinMb.toFixed(1)}MB per 60s (target 20–25MB); ` +
+      `effective ${(avgKbps / 1000).toFixed(2)} Mbps`
+  );
+
+  return out.durationSec > 0.05 ? out.durationSec : outDur;
 }
 
 /**
@@ -323,24 +481,24 @@ async function prepareStoryAssets(
 async function renderWithFfmpeg(
   prepared: PreparedStoryAssets,
   onLog: StoryVideoLog
-): Promise<void> {
+): Promise<number> {
   const {
     workDir,
     outPath,
-    plan,
     voicePath,
     voiceSec,
     captions,
     poolMeta,
-    sceneDurations,
     poolLabel,
     lang,
   } = prepared;
 
+  const speed = resolvePlaybackSpeed();
+  const timedCaptions = scaleCaptionsForSpeed(captions, speed);
   const assPath = path.join(workDir, "story.ass");
   await fs.writeFile(
     assPath,
-    buildAssFromVoiceCaptions(captions, STORY_WIDTH, STORY_HEIGHT, {
+    buildAssFromVoiceCaptions(timedCaptions, STORY_WIDTH, STORY_HEIGHT, {
       fontName: lang === "hi" ? "Nirmala UI" : "Arial Black",
       leadMs: 0,
       wordsPerLine: 3,
@@ -348,21 +506,21 @@ async function renderWithFfmpeg(
     "utf8"
   );
 
-  const clipPaths: string[] = [];
+  const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
   onLog(
-    `B-roll: ${poolLabel} — FFmpeg random cuts totaling ${voiceSec.toFixed(1)}s @ 9:16`
+    `B-roll: ${poolLabel} — ${speed}× whole Short ← ${src.label} (VO ${voiceSec.toFixed(1)}s → ~${(voiceSec / speed).toFixed(1)}s)`
   );
-  for (let i = 0; i < plan.scenes.length; i++) {
-    const d = sceneDurations[i]!;
-    const clipPath = path.join(workDir, `clip-${i}.mp4`);
-    const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
-    onLog(`Scene [${i + 1}/${plan.scenes.length}] ${d.toFixed(1)}s ← ${src.label}`);
-    await cutRandomSegment(src.path, clipPath, d, src.dur, onLog);
-    clipPaths.push(clipPath);
-  }
 
-  onLog("Concatenating clips + voice + captions (FFmpeg 9:16)…");
-  await concatClipsWithVoice(clipPaths, voicePath, assPath, outPath, voiceSec, onLog);
+  return encodeStoryOnePass({
+    brollPath: src.path,
+    brollDurSec: src.dur,
+    voicePath,
+    assPath,
+    outPath,
+    voiceSec,
+    playbackSpeed: speed,
+    onLog,
+  });
 }
 
 async function renderWithRemotion(
@@ -373,10 +531,6 @@ async function renderWithRemotion(
   const { cleanupRemotionAssets } = await import(
     "@/lib/remotion/mapPipelineToInput"
   );
-  // Intro/outro ON by default (Phase 3). Disable with STORY_REMOTION_INTRO=0
-  const introEnv = (process.env.STORY_REMOTION_INTRO || "").trim();
-  const enableIntroOutro = introEnv !== "0" && introEnv.toLowerCase() !== "false";
-
   const input = await mapPipelineToInput({
     jobId: prepared.jobId,
     outDir: prepared.outDir,
@@ -387,18 +541,17 @@ async function renderWithRemotion(
     poolMeta: prepared.poolMeta,
     sceneDurations: prepared.sceneDurations,
     lang: prepared.lang,
-    enableIntroOutro,
     onLog,
   });
 
+  const sc = input.sceneSchedule[0];
   onLog(
-    `B-roll: ${prepared.poolLabel} — Remotion cinema (${input.sceneSchedule.length} scenes, intro/outro=${enableIntroOutro})`
+    `B-roll: ${prepared.poolLabel} — Remotion captions-only (1 continuous clip` +
+      (sc
+        ? `, trim @ ${sc.clipStartSec.toFixed(1)}s, frames ${sc.startFrame}-${sc.endFrame}`
+        : "") +
+      `)`
   );
-  for (const sc of input.sceneSchedule) {
-    onLog(
-      `  Scene ${sc.sceneIndex + 1}: frames ${sc.startFrame}-${sc.endFrame} @ ${sc.clipStartSec.toFixed(1)}s trim`
-    );
-  }
 
   try {
     const { durationInFrames } = await renderStoryShort({
@@ -414,7 +567,7 @@ async function renderWithRemotion(
 }
 
 /**
- * Story → Groq plan → B-roll → VO → Whisper → FFmpeg or Remotion 9:16 MP4.
+ * Story → Groq plan → B-roll → VO → Whisper → FFmpeg (default) or Remotion 9:16 MP4.
  * Only the final story.mp4 is written under public/output.
  * Switch with STORY_RENDERER=ffmpeg|remotion (default ffmpeg).
  */
@@ -442,7 +595,7 @@ export async function buildStoryVideo(
     if (rendererMode === "remotion") {
       durationSec = await renderWithRemotion(prepared, onLog);
     } else {
-      await renderWithFfmpeg(prepared, onLog);
+      durationSec = await renderWithFfmpeg(prepared, onLog);
     }
 
     return {
@@ -463,59 +616,6 @@ export async function buildStoryVideo(
       }
     }
   }
-}
-
-async function concatClipsWithVoice(
-  clipPaths: string[],
-  voicePath: string,
-  assPath: string,
-  outPath: string,
-  voiceSec: number,
-  onLog?: StoryVideoLog
-): Promise<void> {
-  const n = clipPaths.length;
-  const args: string[] = ["-y", "-hide_banner"];
-  for (const c of clipPaths) {
-    args.push("-i", c);
-  }
-  args.push("-i", voicePath);
-
-  const labels = clipPaths.map((_, i) => `[${i}:v]`).join("");
-  const filter = [
-    `${labels}concat=n=${n}:v=1:a=0[vcat]`,
-    `[vcat]ass='${escapePathForFilter(assPath)}'[vout]`,
-    `[${n}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`,
-  ].join(";");
-
-  args.push(
-    "-filter_complex",
-    filter,
-    "-map",
-    "[vout]",
-    "-map",
-    "[aout]",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-crf",
-    "20",
-    "-pix_fmt",
-    "yuv420p",
-    "-r",
-    String(VIDEO_FPS),
-    "-c:a",
-    "aac",
-    "-b:a",
-    "192k",
-    "-t",
-    voiceSec.toFixed(3),
-    "-movflags",
-    "+faststart",
-    outPath
-  );
-
-  await runFfmpeg(args, onLog);
 }
 
 export type { StoryPlan, StoryScene };

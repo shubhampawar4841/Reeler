@@ -40,6 +40,28 @@ function assertReadableFile(filePath: string, label: string): void {
   }
 }
 
+/**
+ * YouTube rejects descriptions with angle brackets, most C0 controls, and broken UTF-16.
+ * Keep newlines/tabs; strip everything else that commonly triggers
+ * "invalid video description".
+ */
+export function sanitizeYoutubeDescription(raw: string, maxLen = 4900): string {
+  let s = String(raw ?? "");
+  // Normalize newlines
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Drop null + C0 controls except \n \t
+  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+  // YouTube API: angle brackets are treated as invalid markup
+  s = s.replace(/[<>]/g, "");
+  // Strip unpaired surrogates (no lookbehind — broader JS target safe)
+  s = s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "");
+  s = s.replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, "$1");
+  // Collapse runaway blank lines
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+  if (s.length > maxLen) s = s.slice(0, maxLen).trim();
+  return s;
+}
+
 /** YouTube Shorts: vertical 9:16 + #Shorts in title/description (no separate "shorts" API flag). */
 function formatAsShort(title: string, description: string, tags: string[]) {
   let t = title.trim().replace(/\s*#Shorts\b/gi, "").trim();
@@ -47,15 +69,13 @@ function formatAsShort(title: string, description: string, tags: string[]) {
   if (t.length > 90) t = t.slice(0, 90).trim();
   const shortsTitle = `${t} #Shorts`.slice(0, 100);
 
-  const descBase = description.trim();
-  const shortsDesc = [
-    descBase,
-    "",
-    "#Shorts #shorts #horror #storytime",
-  ]
-    .filter((line, i, arr) => !(line === "" && arr[i - 1] === ""))
-    .join("\n")
-    .slice(0, 5000);
+  const descBase = sanitizeYoutubeDescription(description, 4800);
+  const shortsDesc = sanitizeYoutubeDescription(
+    [descBase, "", "#Shorts #shorts #horror #storytime"]
+      .filter((line, i, arr) => !(line === "" && arr[i - 1] === ""))
+      .join("\n"),
+    5000
+  );
 
   const tagSet = new Set(
     [...tags, "Shorts", "YouTube Shorts", "shorts", "horror", "story"].map((x) =>
@@ -86,45 +106,62 @@ export async function uploadYoutubeVideo(
     opts.tags ?? []
   );
 
-  const res = await youtube.videos.insert({
-    part: ["snippet", "status"],
-    requestBody: {
-      snippet: {
-        title: shortsTitle,
-        description: shortsDesc,
-        tags: shortsTags,
-        categoryId: opts.categoryId ?? "24", // Entertainment — common for Shorts
+  try {
+    const res = await youtube.videos.insert({
+      part: ["snippet", "status"],
+      requestBody: {
+        snippet: {
+          title: shortsTitle,
+          description: shortsDesc,
+          tags: shortsTags,
+          categoryId: opts.categoryId ?? "24", // Entertainment — common for Shorts
+        },
+        status: {
+          privacyStatus,
+          selfDeclaredMadeForKids: false,
+          ...(opts.publishAt ? { publishAt: opts.publishAt } : {}),
+        },
       },
-      status: {
-        privacyStatus,
-        selfDeclaredMadeForKids: false,
-        ...(opts.publishAt ? { publishAt: opts.publishAt } : {}),
+      media: {
+        body: fs.createReadStream(opts.filePath),
       },
-    },
-    media: {
-      body: fs.createReadStream(opts.filePath),
-    },
-  });
+    });
 
-  const videoId = res.data.id;
-  if (!videoId) throw new Error("YouTube upload succeeded but returned no video id.");
+    const videoId = res.data.id;
+    if (!videoId) throw new Error("YouTube upload succeeded but returned no video id.");
 
-  if (opts.thumbnailPath) {
-    await setYoutubeThumbnail(videoId, opts.thumbnailPath);
+    if (opts.thumbnailPath) {
+      await setYoutubeThumbnail(videoId, opts.thumbnailPath);
+    }
+
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const shortsUrl = `https://www.youtube.com/shorts/${videoId}`;
+
+    return {
+      videoId,
+      title: res.data.snippet?.title ?? shortsTitle,
+      privacyStatus: res.data.status?.privacyStatus ?? privacyStatus,
+      publishedAt: res.data.snippet?.publishedAt,
+      url: shortsUrl,
+      watchUrl,
+      shortsUrl,
+    };
+  } catch (err) {
+    const anyErr = err as {
+      message?: string;
+      errors?: Array<{ message?: string; reason?: string }>;
+      response?: { data?: { error?: { message?: string; errors?: unknown } } };
+    };
+    const apiMsg =
+      anyErr?.response?.data?.error?.message ||
+      anyErr?.errors?.[0]?.message ||
+      anyErr?.message ||
+      String(err);
+    const preview = shortsDesc.slice(0, 180).replace(/\n/g, "\\n");
+    throw new Error(
+      `YouTube upload failed: ${apiMsg} (titleLen=${shortsTitle.length}, descLen=${shortsDesc.length}, descPreview="${preview}…")`
+    );
   }
-
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const shortsUrl = `https://www.youtube.com/shorts/${videoId}`;
-
-  return {
-    videoId,
-    title: res.data.snippet?.title ?? shortsTitle,
-    privacyStatus: res.data.status?.privacyStatus ?? privacyStatus,
-    publishedAt: res.data.snippet?.publishedAt,
-    url: shortsUrl,
-    watchUrl,
-    shortsUrl,
-  };
 }
 
 export async function setYoutubeThumbnail(
@@ -154,7 +191,7 @@ export async function updateYoutubeTitle(
       id: videoId,
       snippet: {
         title: title.slice(0, 100),
-        description: (description ?? "").slice(0, 5000),
+        description: sanitizeYoutubeDescription(description ?? "", 5000),
         categoryId,
       },
     },

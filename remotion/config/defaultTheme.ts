@@ -1,6 +1,6 @@
 import type { RenderThemeConfig } from "./types";
 
-/** Single theme object — tweak here to restyle the whole Short. */
+/** Captions-first theme — intro/outro/progress off; Remotion = karaoke on B-roll. */
 export const defaultTheme: RenderThemeConfig = {
   theme: "horror_shorts",
   captionStyle: "karaoke",
@@ -19,20 +19,20 @@ export const defaultTheme: RenderThemeConfig = {
   animationSpeed: 1,
   transitionDurationSec: 0.42,
   camera: {
-    defaultPreset: "slow_push_in",
-    intensity: 1.1,
+    defaultPreset: "static",
+    intensity: 1,
   },
   progressBar: {
-    enabled: true,
-    showCountdown: true,
+    enabled: false,
+    showCountdown: false,
   },
   intro: {
-    enabled: true,
+    enabled: false,
     variant: "true_story",
     durationSec: 2.1,
   },
   outro: {
-    enabled: true,
+    enabled: false,
     variant: "follow_part_two",
     durationSec: 2.4,
   },

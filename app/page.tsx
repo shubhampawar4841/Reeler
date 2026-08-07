@@ -421,14 +421,14 @@ export default function Home() {
         <section className="flex flex-col gap-5 rounded-2xl border border-rose-900/40 bg-zinc-900/50 p-6 shadow-xl">
           <div className="space-y-1">
             <h2 className="text-lg font-semibold text-rose-200/90">
-              Story → Kokoro / Hindi VO + captions
+              Story → Remotion Short (VO + karaoke + parkour)
             </h2>
             <p className="text-sm text-zinc-400">
               Paste a raw story. Pick <strong className="text-zinc-300">English</strong> or{" "}
-              <strong className="text-zinc-300">Hindi</strong>. Background is always the built-in{" "}
-              <strong className="text-zinc-300">Minecraft parkour</strong> clip (random cuts = VO
-              length, 9:16 Short). No Pexels. Only <code className="text-zinc-500">story.mp4</code>{" "}
-              is saved under <code className="text-zinc-500">public/output</code>.
+              <strong className="text-zinc-300">Hindi</strong>. Renders a 9:16 Remotion Short
+              (parkour B-roll + VO + karaoke). Only{" "}
+              <code className="text-zinc-500">story.mp4</code> is saved under{" "}
+              <code className="text-zinc-500">public/output</code>.
             </p>
           </div>
           <fieldset className="flex flex-wrap gap-3">

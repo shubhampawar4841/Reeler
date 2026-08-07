@@ -46,7 +46,7 @@ async function getKokoroTts(): Promise<KokoroInstance> {
 }
 
 function resolveEnVoice(): string {
-  return process.env.KOKORO_VOICE?.trim() || "am_fenrir";
+  return process.env.KOKORO_VOICE?.trim() || "af_heart";
 }
 
 /** Edge neural voice for Hindi (kokoro-js npm has no hf_/hm_ voices yet). */
@@ -173,7 +173,7 @@ async function synthesizeKokoroEn(
   try {
     if (text.length <= KOKORO_ONE_SHOT_MAX_CHARS) {
       const audio = await tts.generate(text, {
-        voice: voice as "af_heart",
+        voice: voice as "af_bella",
         speed,
       });
       await Promise.resolve(audio.save(outPath));
@@ -189,7 +189,7 @@ async function synthesizeKokoroEn(
         const piece = parts[i]!;
         const part = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
         const audio = await tts.generate(piece, {
-          voice: voice as "af_heart",
+          voice: voice as "af_bella",
           speed,
         });
         await Promise.resolve(audio.save(part));

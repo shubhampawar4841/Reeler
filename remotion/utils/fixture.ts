@@ -9,18 +9,12 @@ import { defaultTheme } from "../config/defaultTheme";
 import { secToFrames } from "./frames";
 
 /**
- * Phase 1 fixture — no TTS/Whisper/Groq.
- * Uses solid fallback bg when clipPath is null; captions drive karaoke.
+ * Studio fixture — one continuous plate + karaoke captions (no intro/outro).
  */
 export function buildFixtureStoryInput(): StoryRenderInput {
   const fps = STORY_REMOTION_FPS;
   const voiceDurationSec = 8;
-  const introSec = defaultTheme.intro.enabled ? defaultTheme.intro.durationSec : 0;
-  const outroSec = defaultTheme.outro.enabled ? defaultTheme.outro.durationSec : 0;
-  const bodySec = voiceDurationSec;
-  const introFrames = secToFrames(introSec, fps);
-  const bodyFrames = secToFrames(bodySec, fps);
-  const half = Math.floor(bodyFrames / 2);
+  const bodyFrames = secToFrames(voiceDurationSec, fps);
 
   const captions: Caption[] = [
     { text: "I", startMs: 200, endMs: 450, timestampMs: 200, confidence: 1 },
@@ -47,27 +41,16 @@ export function buildFixtureStoryInput(): StoryRenderInput {
   const sceneSchedule: ScheduledScene[] = [
     {
       sceneIndex: 0,
-      startFrame: introFrames,
-      endFrame: introFrames + half,
-      narration: "I kept hearing someone crying next door.",
+      startFrame: 0,
+      endFrame: bodyFrames,
+      narration:
+        "I kept hearing someone crying next door. At first I thought I was imagining it. I shouldn't have knocked.",
       clipPath: null,
       clipStartSec: 0,
       captionStyle: "karaoke",
-      camera: "slow_push_in",
-      transition: "fade",
-      emotion: "curiosity",
-    },
-    {
-      sceneIndex: 1,
-      startFrame: introFrames + half,
-      endFrame: introFrames + bodyFrames,
-      narration: "At first I thought I was imagining it.",
-      clipPath: null,
-      clipStartSec: 12,
-      captionStyle: "horror",
-      camera: "handheld_shake",
-      transition: "glitch",
-      emotion: "panic",
+      camera: "static",
+      transition: "cut",
+      emotion: "calm",
     },
   ];
 
@@ -76,7 +59,7 @@ export function buildFixtureStoryInput(): StoryRenderInput {
     width: STORY_REMOTION_WIDTH,
     height: STORY_REMOTION_HEIGHT,
     voicePath: null,
-    voiceDurationSec: voiceDurationSec + introSec + outroSec,
+    voiceDurationSec,
     captions,
     plan: {
       title: "The Knock Next Door",
@@ -92,13 +75,8 @@ export function buildFixtureStoryInput(): StoryRenderInput {
 }
 
 export function getCompositionDurationInFrames(input: StoryRenderInput): number {
-  const intro = input.config.intro.enabled
-    ? secToFrames(input.config.intro.durationSec, input.fps)
-    : 0;
-  const outro = input.config.outro.enabled
-    ? secToFrames(input.config.outro.durationSec, input.fps)
-    : 0;
   const last = input.sceneSchedule[input.sceneSchedule.length - 1];
-  const bodyEnd = last?.endFrame ?? secToFrames(input.voiceDurationSec, input.fps);
-  return Math.max(intro + outro + 1, bodyEnd + outro);
+  const bodyEnd =
+    last?.endFrame ?? secToFrames(input.voiceDurationSec, input.fps);
+  return Math.max(1, bodyEnd);
 }

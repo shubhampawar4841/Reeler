@@ -1,9 +1,11 @@
 /**
  * Map prepared story assets → Remotion StoryRenderInput.
- * Used when STORY_RENDERER=remotion (Phase 2).
+ *
+ * Simple format: one continuous B-roll + VO + Whisper karaoke captions.
+ * No intro/outro, no scene cuts / clip switching.
  *
  * Media must live under public/ and be referenced as public-relative paths
- * (Remotion staticFile) — file:// and raw disk paths fail in headless Chrome.
+ * (Remotion staticFile).
  */
 
 import fs from "node:fs/promises";
@@ -13,11 +15,9 @@ import type { StoryLang } from "@/lib/groqStoryboard";
 import type { StoryPlan } from "@/lib/storyTypes";
 import { defaultTheme } from "@/remotion/config/defaultTheme";
 import type {
-  CameraPreset,
   RenderThemeConfig,
   ScheduledScene,
   StoryRenderInput,
-  TransitionKind,
 } from "@/remotion/config/types";
 import {
   STORY_REMOTION_FPS,
@@ -43,15 +43,12 @@ export type MapPipelineToInputArgs = {
   poolMeta: BrollPoolItem[];
   sceneDurations: number[];
   lang: StoryLang;
-  /** When false, skip title/outro cards. Default true (Phase 3). Opt out: STORY_REMOTION_INTRO=0 */
+  /** Ignored — intro/outro always off in the captions-only Remotion path. */
   enableIntroOutro?: boolean;
   onLog?: (msg: string) => void;
 };
 
-function productionTheme(
-  lang: StoryLang,
-  enableIntroOutro: boolean
-): RenderThemeConfig {
+function captionsOnlyTheme(lang: StoryLang): RenderThemeConfig {
   return {
     ...defaultTheme,
     font: {
@@ -61,13 +58,21 @@ function productionTheme(
           ? "Nirmala UI, Arial Black, sans-serif"
           : defaultTheme.font.family,
     },
+    camera: {
+      defaultPreset: "static",
+      intensity: 1,
+    },
+    progressBar: {
+      enabled: false,
+      showCountdown: false,
+    },
     intro: {
       ...defaultTheme.intro,
-      enabled: enableIntroOutro,
+      enabled: false,
     },
     outro: {
       ...defaultTheme.outro,
-      enabled: enableIntroOutro,
+      enabled: false,
     },
   };
 }
@@ -78,8 +83,8 @@ function publicRel(jobId: string, ...parts: string[]): string {
 }
 
 /**
- * Copy VO + B-roll into public/output/<jobId>/assets so Remotion can staticFile them.
- * Returns StoryRenderInput ready for renderMedia.
+ * Copy VO + one B-roll into public/output/<jobId>/assets.
+ * Returns StoryRenderInput with a single continuous scene for Remotion.
  */
 export async function mapPipelineToInput(
   args: MapPipelineToInputArgs
@@ -92,9 +97,7 @@ export async function mapPipelineToInput(
     voiceSec,
     captions,
     poolMeta,
-    sceneDurations,
     lang,
-    enableIntroOutro = true,
     onLog,
   } = args;
 
@@ -110,57 +113,46 @@ export async function mapPipelineToInput(
   await fs.copyFile(voicePath, voiceDest);
   const voicePublic = publicRel(jobId, "assets", "voice.wav");
 
-  const brollPublicByAbs = new Map<string, string>();
-  for (let i = 0; i < poolMeta.length; i++) {
-    const item = poolMeta[i]!;
-    const destName = `broll-${i + 1}${path.extname(item.path) || ".mp4"}`;
-    const dest = path.join(assetsDir, destName);
-    onLog?.(`Copying B-roll ${item.label} → assets/${destName}`);
-    await fs.copyFile(item.path, dest);
-    brollPublicByAbs.set(path.resolve(item.path), publicRel(jobId, "assets", destName));
+  // One continuous B-roll — pick a random source, one random in-point trim.
+  const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
+  const destName = `broll${path.extname(src.path) || ".mp4"}`;
+  const dest = path.join(assetsDir, destName);
+  onLog?.(`Copying continuous B-roll ${src.label} → assets/${destName}`);
+  await fs.copyFile(src.path, dest);
+  const clipPublic = publicRel(jobId, "assets", destName);
+
+  const needSec = Math.max(0.5, voiceSec);
+  const maxStart = Math.max(0, src.dur - needSec - 0.05);
+  const clipStartSec = maxStart > 0 ? Math.random() * maxStart : 0;
+  if (src.dur + 0.05 < needSec) {
+    onLog?.(
+      `B-roll ${src.label} (${src.dur.toFixed(1)}s) shorter than VO (${needSec.toFixed(1)}s) — will loop`
+    );
+  } else {
+    onLog?.(
+      `Continuous B-roll trim @ ${clipStartSec.toFixed(1)}s for ${needSec.toFixed(1)}s (no scene cuts)`
+    );
   }
 
   const fps = STORY_REMOTION_FPS;
-  const config = productionTheme(lang, enableIntroOutro);
-  const introFrames = config.intro.enabled
-    ? secToFrames(config.intro.durationSec, fps)
-    : 0;
+  const config = captionsOnlyTheme(lang);
+  const durFrames = secToFrames(needSec, fps);
 
-  let cursor = introFrames;
-  const sceneSchedule: ScheduledScene[] = plan.scenes.map((sc, i) => {
-    const durSec = Math.max(0.5, sceneDurations[i] ?? 1);
-    const durFrames = secToFrames(durSec, fps);
-    const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
-    const maxStart = Math.max(0, src.dur - durSec - 0.05);
-    const clipStartSec = maxStart > 0 ? Math.random() * maxStart : 0;
-    const clipPublic =
-      brollPublicByAbs.get(path.resolve(src.path)) ??
-      publicRel(jobId, "assets", `broll-1.mp4`);
-
-    const startFrame = cursor;
-    const endFrame = cursor + durFrames;
-    cursor = endFrame;
-
-    return {
-      sceneIndex: i,
-      startFrame,
-      endFrame,
+  const sceneSchedule: ScheduledScene[] = [
+    {
+      sceneIndex: 0,
+      startFrame: 0,
+      endFrame: Math.max(1, durFrames),
       title: plan.title,
-      narration: sc.narration,
+      narration: plan.fullNarration,
       clipPath: clipPublic,
       clipStartSec,
-      captionStyle: sc.captionStyle,
-      camera: (sc.cameraMovement || config.camera.defaultPreset) as CameraPreset,
-      transition: (sc.transition || "cut") as TransitionKind,
-      emotion: sc.emotion,
-    };
-  });
-
-  const bodyTarget = introFrames + secToFrames(voiceSec, fps);
-  if (sceneSchedule.length > 0) {
-    const last = sceneSchedule[sceneSchedule.length - 1]!;
-    last.endFrame = Math.max(last.startFrame + 1, bodyTarget);
-  }
+      captionStyle: "karaoke",
+      camera: "static",
+      transition: "cut",
+      emotion: "calm",
+    },
+  ];
 
   return {
     fps,
@@ -176,12 +168,12 @@ export async function mapPipelineToInput(
       fullNarration: plan.fullNarration,
       scenes: plan.scenes,
     },
-    brollClips: poolMeta.map((p, i) => ({
-      path:
-        brollPublicByAbs.get(path.resolve(p.path)) ??
-        publicRel(jobId, "assets", `broll-${i + 1}.mp4`),
-      durationSec: p.dur,
-    })),
+    brollClips: [
+      {
+        path: clipPublic,
+        durationSec: src.dur,
+      },
+    ],
     sceneSchedule,
     config,
   };
