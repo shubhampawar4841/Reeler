@@ -11,6 +11,7 @@ import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
 import {
   synthesizeStoryVoice,
   warmKokoroTts,
+  preferEdgeTts,
   type VoiceGender,
 } from "@/lib/kokoroTts";
 import { alignVoiceCaptions } from "@/lib/alignVoiceCaptions";
@@ -621,7 +622,11 @@ async function prepareStoryAssets(
   const warmTts =
     lang === "en"
       ? warmKokoroTts().then(() => {
-          onLog("Kokoro model warm (overlapped with plan/B-roll)");
+          onLog(
+            preferEdgeTts()
+              ? "TTS: Edge (serverless) — Kokoro skipped"
+              : "Kokoro model warm (overlapped with plan/B-roll)"
+          );
         })
       : Promise.resolve();
 
@@ -646,7 +651,9 @@ async function prepareStoryAssets(
   onLog(
     lang === "hi"
       ? `Synthesizing Hindi voice-over (${gender})…`
-      : `Synthesizing English Kokoro voice-over (${gender})…`
+      : preferEdgeTts()
+        ? `Synthesizing English Edge voice-over (${gender})…`
+        : `Synthesizing English voice-over (${gender}, Kokoro→Edge fallback)…`
   );
   const voice = await synthesizeStoryVoice(
     plan.fullNarration,
