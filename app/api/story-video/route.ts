@@ -4,7 +4,9 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import type { StoryLang } from "@/lib/groqStoryboard";
+import type { VoiceGender } from "@/lib/kokoroTts";
 import { buildStoryVideo } from "@/lib/storyVideoPipeline";
+import { fetchYoutubeStoryText } from "@/lib/youtubeTranscript";
 
 export const runtime = "nodejs";
 /** Longer narrations (2–6 min) need more headroom than default. */
@@ -26,10 +28,29 @@ function parseLang(raw: unknown): StoryLang {
   return s === "hi" || s === "hindi" ? "hi" : "en";
 }
 
+function parseGender(raw: unknown): VoiceGender {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return s === "male" ? "male" : "female";
+}
+
+function parseStorySpeed(raw: unknown): {
+  storySpeed: number | null;
+  autoFitSpeed: boolean;
+} {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!s || s === "auto") {
+    return { storySpeed: 1.35, autoFitSpeed: true };
+  }
+  const n = Number(s);
+  if (Number.isFinite(n) && n >= 1 && n <= 2.5) {
+    return { storySpeed: n, autoFitSpeed: true };
+  }
+  return { storySpeed: 1.35, autoFitSpeed: true };
+}
+
 /**
  * POST /api/story-video
- * multipart: story, lang (en|hi), optional video
- * JSON: { story, lang? }
+ * multipart/JSON: story OR youtubeUrl (+ lang, brollId, voiceGender, storySpeed)
  */
 export async function POST(req: Request) {
   const logs: LogEntry[] = [];
@@ -44,13 +65,26 @@ export async function POST(req: Request) {
   try {
     const ct = req.headers.get("content-type") ?? "";
     let story = "";
+    let youtubeUrl = "";
     let lang: StoryLang = "en";
+    let brollId: string | null = null;
+    let voiceGender: VoiceGender = "female";
+    let storySpeed: number | null = 1.35;
+    let autoFitSpeed = true;
 
     if (ct.includes("multipart/form-data")) {
       const form = await req.formData();
       const storyField = form.get("story");
       story = typeof storyField === "string" ? storyField.trim() : "";
+      const ytField = form.get("youtubeUrl");
+      youtubeUrl = typeof ytField === "string" ? ytField.trim() : "";
       lang = parseLang(form.get("lang"));
+      voiceGender = parseGender(form.get("voiceGender"));
+      const speedParsed = parseStorySpeed(form.get("storySpeed"));
+      storySpeed = speedParsed.storySpeed;
+      autoFitSpeed = speedParsed.autoFitSpeed;
+      const bid = form.get("brollId");
+      brollId = typeof bid === "string" && bid.trim() ? bid.trim() : null;
 
       const videoField = form.get("video");
       if (videoField && typeof videoField !== "string" && "arrayBuffer" in videoField) {
@@ -73,7 +107,7 @@ export async function POST(req: Request) {
           const buf = Buffer.from(await file.arrayBuffer());
           await fs.writeFile(backgroundVideoPath, buf);
           push(
-            `Uploaded B-roll saved (${(buf.length / (1024 * 1024)).toFixed(1)} MB) — Pexels skipped`
+            `Uploaded B-roll saved (${(buf.length / (1024 * 1024)).toFixed(1)} MB)`
           );
         }
       }
@@ -84,48 +118,84 @@ export async function POST(req: Request) {
           {
             ok: false,
             error:
-              'Empty body. Send JSON { "story": "…", "lang": "en"|"hi" } or multipart.',
+              'Empty body. Send JSON { "story" } or { "youtubeUrl" } (+ options).',
             logs,
           },
           { status: 400 }
         );
       }
-      let body: { story?: string; lang?: string };
+      let body: {
+        story?: string;
+        youtubeUrl?: string;
+        lang?: string;
+        brollId?: string;
+        voiceGender?: string;
+        storySpeed?: string | number;
+      };
       try {
-        body = JSON.parse(raw) as { story?: string; lang?: string };
+        body = JSON.parse(raw) as typeof body;
       } catch {
         return NextResponse.json(
           {
             ok: false,
-            error: 'Invalid JSON. Send: { "story": "…", "lang": "en"|"hi" }',
+            error:
+              'Invalid JSON. Send: { "story" } or { "youtubeUrl" } (+ options).',
             logs,
           },
           { status: 400 }
         );
       }
       story = typeof body.story === "string" ? body.story.trim() : "";
+      youtubeUrl =
+        typeof body.youtubeUrl === "string" ? body.youtubeUrl.trim() : "";
       lang = parseLang(body.lang);
+      voiceGender = parseGender(body.voiceGender);
+      const speedParsed = parseStorySpeed(body.storySpeed);
+      storySpeed = speedParsed.storySpeed;
+      autoFitSpeed = speedParsed.autoFitSpeed;
+      brollId =
+        typeof body.brollId === "string" && body.brollId.trim()
+          ? body.brollId.trim()
+          : null;
+    }
+
+    if (youtubeUrl) {
+      push(`Fetching YouTube transcript: ${youtubeUrl}`);
+      const yt = await fetchYoutubeStoryText(youtubeUrl, { lang });
+      story = yt.text;
+      push(
+        `YouTube transcript ready (${yt.segmentCount} segments, ~${yt.durationSec.toFixed(0)}s source, ${story.length} chars) from ${yt.videoId}`
+      );
     }
 
     if (!story || story.length < 20) {
       return NextResponse.json(
         {
           ok: false,
-          error: "Provide a story (at least ~20 characters).",
+          error:
+            "Provide a story text (≥20 chars) or a YouTube link with captions.",
           logs,
         },
         { status: 400 }
       );
     }
 
-    push(`Story received (${story.length} chars, lang=${lang})`);
-    if (!backgroundVideoPath) {
-      push("Using Supabase Minecraft parkour B-roll");
-    }
+    push(
+      `Story received (${story.length} chars, lang=${lang}, voice=${voiceGender}` +
+        `, speed=${storySpeed ?? "auto"}×` +
+        (brollId ? `, broll=${brollId}` : ", broll=auto") +
+        (youtubeUrl ? ", source=youtube" : ", source=manual") +
+        `)`
+    );
+
     const result = await buildStoryVideo({
       story,
       lang,
       backgroundVideoPath,
+      brollId,
+      voiceGender,
+      storySpeed,
+      autoFitSpeed,
       onLog: push,
     });
 
@@ -138,6 +208,8 @@ export async function POST(req: Request) {
       brollSource: result.brollSource,
       lang: result.lang,
       renderer: result.renderer,
+      sourceStoryChars: story.length,
+      youtubeUrl: youtubeUrl || null,
       logs,
       message: `Story Short ready (${result.renderer}, B-roll: ${result.brollSource}).`,
     });

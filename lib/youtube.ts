@@ -62,6 +62,22 @@ export function sanitizeYoutubeDescription(raw: string, maxLen = 4900): string {
   return s;
 }
 
+/** Default tags/hashtags for every YouTube Short upload. */
+export const DEFAULT_YOUTUBE_HASHTAGS = [
+  "illustration",
+  "tattoo",
+  "art",
+  "pov",
+  "procreate",
+  "drawing",
+  "whydidntmyexcomeback",
+  "digitalart",
+] as const;
+
+function hashtagLine(tags: readonly string[]): string {
+  return tags.map((t) => `#${t.replace(/^#/, "")}`).join(" ");
+}
+
 /** YouTube Shorts: vertical 9:16 + #Shorts in title/description (no separate "shorts" API flag). */
 function formatAsShort(title: string, description: string, tags: string[]) {
   let t = title.trim().replace(/\s*#Shorts\b/gi, "").trim();
@@ -70,17 +86,26 @@ function formatAsShort(title: string, description: string, tags: string[]) {
   const shortsTitle = `${t} #Shorts`.slice(0, 100);
 
   const descBase = sanitizeYoutubeDescription(description, 4800);
+  const brandTags = [...DEFAULT_YOUTUBE_HASHTAGS];
   const shortsDesc = sanitizeYoutubeDescription(
-    [descBase, "", "#Shorts #shorts #horror #storytime"]
+    [
+      descBase,
+      "",
+      `#Shorts ${hashtagLine(brandTags)}`,
+    ]
       .filter((line, i, arr) => !(line === "" && arr[i - 1] === ""))
       .join("\n"),
     5000
   );
 
   const tagSet = new Set(
-    [...tags, "Shorts", "YouTube Shorts", "shorts", "horror", "story"].map((x) =>
-      x.trim()
-    )
+    [
+      ...tags,
+      ...brandTags,
+      "Shorts",
+      "YouTube Shorts",
+      "shorts",
+    ].map((x) => x.trim().replace(/^#/, ""))
   );
   const shortsTags = [...tagSet].filter(Boolean).slice(0, 30);
 

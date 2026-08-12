@@ -1,260 +1,70 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-type LogLine = { level: "info" | "error"; message: string; progress?: number };
+type LogLine = { level: "info" | "error"; message: string };
 
-type ApiOk = { ok: boolean; logs?: LogLine[]; error?: string; [k: string]: unknown };
+type BrollOpt = { id: string; label: string; kind: string };
 
-function mergeLogs(prev: LogLine[], next?: LogLine[]) {
-  if (!next?.length) return prev;
-  return [...prev, ...next];
+type StoryPlanLite = {
+  title?: string;
+  hook?: string;
+  endingQuestion?: string;
+  fullNarration?: string;
+  scenes?: Array<{ narration?: string }>;
+};
+
+const SPEED_PRESETS = [
+  { id: "1.25", label: "1.25×", hint: "Slightly snappy" },
+  { id: "1.35", label: "1.35×", hint: "Default" },
+  { id: "1.5", label: "1.5×", hint: "Fast Shorts pace" },
+  { id: "auto", label: "Auto ≤2:59", hint: "Fits YouTube Shorts" },
+] as const;
+
+function formatDuration(sec: number | null | undefined): string {
+  if (sec == null || !Number.isFinite(sec)) return "—";
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
 }
 
 export default function Home() {
-  const [images, setImages] = useState<File[]>([]);
-  const [audio, setAudio] = useState<File | null>(null);
-  const [music, setMusic] = useState<File | null>(null);
-  /** (M:SS) markers drive slide length + subtitles; voice-over is still your uploaded audio */
-  const [timedTranscript, setTimedTranscript] = useState("");
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [storyboards, setStoryboards] = useState<File[]>([]);
-  const [cropLoading, setCropLoading] = useState(false);
-  const [cropError, setCropError] = useState<string | null>(null);
-  const [upscaleFiles, setUpscaleFiles] = useState<File[]>([]);
-  const [upscaleLoading, setUpscaleLoading] = useState(false);
-  const [upscaleError, setUpscaleError] = useState<string | null>(null);
-  const [captionVideoFile, setCaptionVideoFile] = useState<File | null>(null);
-  const [captionLoading, setCaptionLoading] = useState(false);
-  const [captionError, setCaptionError] = useState<string | null>(null);
-  const [captionedUrl, setCaptionedUrl] = useState<string | null>(null);
-  const [captionStatus, setCaptionStatus] = useState("");
   const [storyText, setStoryText] = useState("");
+  const [storySource, setStorySource] = useState<"manual" | "youtube">("manual");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
   const [storyLoading, setStoryLoading] = useState(false);
   const [storyError, setStoryError] = useState<string | null>(null);
   const [storyVideoUrl, setStoryVideoUrl] = useState<string | null>(null);
   const [storyLogs, setStoryLogs] = useState<LogLine[]>([]);
   const [storyTitle, setStoryTitle] = useState<string | null>(null);
+  const [storyPlan, setStoryPlan] = useState<StoryPlanLite | null>(null);
+  const [storyMeta, setStoryMeta] = useState<{
+    durationSec?: number;
+    brollSource?: string;
+    renderer?: string;
+    lang?: string;
+  } | null>(null);
   const [storyLang, setStoryLang] = useState<"en" | "hi">("en");
+  const [voiceGender, setVoiceGender] = useState<"female" | "male">("female");
+  const [storySpeed, setStorySpeed] = useState<string>("auto");
+  const [brollId, setBrollId] = useState("");
+  const [brollOptions, setBrollOptions] = useState<BrollOpt[]>([]);
+
   const [ytConnected, setYtConnected] = useState(false);
   const [ytChannel, setYtChannel] = useState<string | null>(null);
   const [ytUploading, setYtUploading] = useState(false);
   const [ytError, setYtError] = useState<string | null>(null);
   const [ytUrl, setYtUrl] = useState<string | null>(null);
-  const [ytPrivacy, setYtPrivacy] = useState<"private" | "unlisted" | "public">("private");
+  const [ytPrivacy, setYtPrivacy] = useState<"private" | "unlisted" | "public">(
+    "private"
+  );
 
-  const onStoryboardsChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const list = e.target.files ? Array.from(e.target.files) : [];
-    setStoryboards(list);
-    setCropError(null);
-  };
+  const logEndRef = useRef<HTMLDivElement | null>(null);
 
-  const runStoryboardCrop = async () => {
-    if (storyboards.length === 0) return;
-    setCropLoading(true);
-    setCropError(null);
-    try {
-      const fd = new FormData();
-      for (const f of storyboards) {
-        fd.append("storyboards", f);
-      }
-      const res = await fetch("/api/crop-storyboard", { method: "POST", body: fd });
-      const ct = res.headers.get("Content-Type") ?? "";
-      if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(j.error ?? `Crop failed (${res.status})`);
-      }
-      if (!ct.includes("zip")) {
-        throw new Error("Unexpected response (expected a ZIP file).");
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "storyboard-scenes.zip";
-      a.rel = "noopener";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setCropError(msg);
-    } finally {
-      setCropLoading(false);
-    }
-  };
-
-  const canCropStoryboards = storyboards.length > 0 && !cropLoading;
-
-  const onUpscaleFilesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const list = e.target.files ? Array.from(e.target.files) : [];
-    setUpscaleFiles(list);
-    setUpscaleError(null);
-  };
-
-  const runUpscaleBatch = async () => {
-    if (upscaleFiles.length === 0) return;
-    setUpscaleLoading(true);
-    setUpscaleError(null);
-    try {
-      const fd = new FormData();
-      for (const f of upscaleFiles) {
-        fd.append("upscaleImages", f);
-      }
-      const res = await fetch("/api/upscale-batch", { method: "POST", body: fd });
-      const ct = res.headers.get("Content-Type") ?? "";
-      if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(j.error ?? `Upscale failed (${res.status})`);
-      }
-      if (!ct.includes("zip")) {
-        throw new Error("Unexpected response (expected a ZIP file).");
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "upscaled-2x.zip";
-      a.rel = "noopener";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setUpscaleError(msg);
-    } finally {
-      setUpscaleLoading(false);
-    }
-  };
-
-  const canUpscaleBatch = upscaleFiles.length > 0 && !upscaleLoading;
-
-  const onCaptionVideoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
-    setCaptionVideoFile(f);
-    setCaptionError(null);
-    setCaptionedUrl(null);
-    setCaptionStatus("");
-  };
-
-  const runCaptionVideo = async () => {
-    if (!captionVideoFile) return;
-    setCaptionLoading(true);
-    setCaptionError(null);
-    setCaptionedUrl(null);
-    setCaptionStatus("Loading Whisper Web…");
-    try {
-      const {
-        canUseWhisperWeb,
-        downloadWhisperModel,
-        resampleTo16Khz,
-        transcribe,
-        toCaptions,
-      } = await import("@remotion/whisper-web");
-
-      const model = "tiny.en" as const;
-      const { supported, detailedReason } = await canUseWhisperWeb(model);
-      if (!supported) {
-        throw new Error(
-          `Whisper Web needs cross-origin isolation (SharedArrayBuffer). Restart the App after next.config headers. Detail: ${detailedReason}`
-        );
-      }
-
-      setCaptionStatus("Downloading Whisper model (tiny.en, first time only)…");
-      await downloadWhisperModel({
-        model,
-        onProgress: ({ progress }) =>
-          setCaptionStatus(`Downloading model… ${Math.round(progress * 100)}%`),
-      });
-
-      setCaptionStatus("Resampling audio to 16 kHz…");
-      const channelWaveform = await resampleTo16Khz({
-        file: captionVideoFile,
-        onProgress: (p) => setCaptionStatus(`Resampling… ${Math.round(p * 100)}%`),
-      });
-
-      setCaptionStatus("Transcribing (free, on-device)…");
-      const whisperWebOutput = await transcribe({
-        channelWaveform,
-        model,
-        onProgress: (p) => setCaptionStatus(`Transcribing… ${Math.round(p * 100)}%`),
-      });
-
-      const { captions } = toCaptions({ whisperWebOutput });
-      if (!captions.length) {
-        throw new Error("Transcription produced no words. Try a clearer / longer clip with speech.");
-      }
-
-      setCaptionStatus(`Burning ${captions.length} caption tokens onto video…`);
-      const fd = new FormData();
-      fd.append("video", captionVideoFile);
-      fd.append("captions", JSON.stringify(captions));
-      const res = await fetch("/api/caption-video", { method: "POST", body: fd });
-      const json = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        videoUrl?: string;
-      };
-      if (!res.ok || !json.ok || !json.videoUrl) {
-        throw new Error(json.error ?? `Caption burn failed (${res.status})`);
-      }
-      setCaptionedUrl(`${json.videoUrl}?t=${Date.now()}`);
-      setCaptionStatus("Done.");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setCaptionError(msg);
-      setCaptionStatus("");
-    } finally {
-      setCaptionLoading(false);
-    }
-  };
-
-  const canCaptionVideo = Boolean(captionVideoFile) && !captionLoading;
-
-  const runStoryVideo = async () => {
-    if (storyText.trim().length < 20) return;
-    setStoryLoading(true);
-    setStoryError(null);
-    setStoryVideoUrl(null);
-    setStoryTitle(null);
-    setStoryLogs([]);
-    try {
-      const fd = new FormData();
-      fd.append("story", storyText.trim());
-      fd.append("lang", storyLang);
-      const res = await fetch("/api/story-video", {
-        method: "POST",
-        body: fd,
-        cache: "no-store",
-      });
-      const json = (await res.json()) as ApiOk & {
-        videoUrl?: string;
-        plan?: { title?: string };
-      };
-      if (json.logs?.length) {
-        setStoryLogs(json.logs);
-      }
-      if (!res.ok || !json.ok || !json.videoUrl) {
-        throw new Error(json.error ?? `Story video failed (${res.status})`);
-      }
-      setStoryTitle(json.plan?.title ?? null);
-      setStoryVideoUrl(`${json.videoUrl}?t=${Date.now()}`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setStoryError(msg);
-      setStoryLogs((prev) => [...prev, { level: "error", message: msg }]);
-    } finally {
-      setStoryLoading(false);
-    }
-  };
-
-  const canStoryVideo = storyText.trim().length >= 20 && !storyLoading;
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [storyLogs]);
 
   const refreshYoutubeStatus = useCallback(async () => {
     try {
@@ -275,6 +85,83 @@ export default function Home() {
     void refreshYoutubeStatus();
   }, [refreshYoutubeStatus]);
 
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await fetch("/api/broll", { cache: "no-store" });
+        const j = (await res.json()) as { ok?: boolean; items?: BrollOpt[] };
+        if (j.ok && j.items?.length) {
+          setBrollOptions(j.items);
+          const firstLocal = j.items.find((i) => i.kind === "local");
+          setBrollId((prev) => prev || firstLocal?.id || j.items![0]!.id);
+        }
+      } catch {
+        /* server auto-picks */
+      }
+    })();
+  }, []);
+
+  const runStoryVideo = async () => {
+    if (storySource === "manual" && storyText.trim().length < 20) return;
+    if (storySource === "youtube" && youtubeUrl.trim().length < 10) return;
+    setStoryLoading(true);
+    setStoryError(null);
+    setStoryVideoUrl(null);
+    setStoryTitle(null);
+    setStoryPlan(null);
+    setStoryMeta(null);
+    setYtUrl(null);
+    setYtError(null);
+    setStoryLogs([{ level: "info", message: "Starting story job…" }]);
+    try {
+      const fd = new FormData();
+      if (storySource === "youtube") {
+        fd.append("youtubeUrl", youtubeUrl.trim());
+      } else {
+        fd.append("story", storyText.trim());
+      }
+      fd.append("lang", storyLang);
+      fd.append("voiceGender", voiceGender);
+      fd.append("storySpeed", storySpeed);
+      if (brollId) fd.append("brollId", brollId);
+      const res = await fetch("/api/story-video", {
+        method: "POST",
+        body: fd,
+        cache: "no-store",
+      });
+      const json = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        videoUrl?: string;
+        durationSec?: number;
+        brollSource?: string;
+        renderer?: string;
+        lang?: string;
+        plan?: StoryPlanLite;
+        logs?: LogLine[];
+      };
+      if (json.logs?.length) setStoryLogs(json.logs);
+      if (!res.ok || !json.ok || !json.videoUrl) {
+        throw new Error(json.error ?? `Story video failed (${res.status})`);
+      }
+      setStoryTitle(json.plan?.title ?? null);
+      setStoryPlan(json.plan ?? null);
+      setStoryMeta({
+        durationSec: json.durationSec,
+        brollSource: json.brollSource,
+        renderer: json.renderer,
+        lang: json.lang,
+      });
+      setStoryVideoUrl(`${json.videoUrl}?t=${Date.now()}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStoryError(msg);
+      setStoryLogs((prev) => [...prev, { level: "error", message: msg }]);
+    } finally {
+      setStoryLoading(false);
+    }
+  };
+
   const uploadStoryToYoutube = async () => {
     if (!storyVideoUrl) return;
     setYtUploading(true);
@@ -287,8 +174,21 @@ export default function Home() {
         body: JSON.stringify({
           videoUrl: storyVideoUrl.split("?")[0],
           title: (storyTitle || "AI Story").slice(0, 100),
-          description: `Created with Reeler\n\n${storyText.trim().slice(0, 4000)}`,
-          tags: ["horror", "story", "ai", "reeler"],
+          description: `Created with Reeler\n\n${
+            storySource === "youtube"
+              ? `Source: ${youtubeUrl.trim()}`
+              : storyText.trim().slice(0, 4000)
+          }`,
+          tags: [
+            "illustration",
+            "tattoo",
+            "art",
+            "pov",
+            "procreate",
+            "drawing",
+            "whydidntmyexcomeback",
+            "digitalart",
+          ],
           privacyStatus: ytPrivacy,
         }),
       });
@@ -298,7 +198,7 @@ export default function Home() {
         url?: string;
       };
       if (!res.ok || !j.ok || !j.url) {
-        throw new Error(j.error ?? `Upload failed (${res.status})`);
+        throw new Error(j.error ?? `YouTube upload failed (${res.status})`);
       }
       setYtUrl(j.url);
     } catch (e) {
@@ -308,206 +208,296 @@ export default function Home() {
     }
   };
 
-  const [progress, setProgress] = useState(0);
-
-  const appendLogs = useCallback((res: ApiOk) => {
-    setLogs((prev) => mergeLogs(prev, res.logs));
-    if (!res.ok && typeof res.error === "string") {
-      setError(res.error);
-    }
-  }, []);
-
-  const onImagesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const list = e.target.files ? Array.from(e.target.files) : [];
-    setImages(list);
-    setError(null);
-    setVideoUrl(null);
-  };
-
-  const onAudioChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
-    setAudio(f);
-    setError(null);
-    setVideoUrl(null);
-  };
-
-  const onMusicChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
-    setMusic(f);
-    setError(null);
-    setVideoUrl(null);
-  };
-
-  const canGenerate = useMemo(
-    () =>
-      images.length > 0 &&
-      Boolean(audio) &&
-      timedTranscript.trim().length > 0 &&
-      !loading,
-    [images.length, audio, timedTranscript, loading]
-  );
-
-  const runPipeline = async () => {
-    if (!audio || images.length === 0 || !timedTranscript.trim()) return;
-    setLoading(true);
-    setError(null);
-    setLogs([]);
-    setVideoUrl(null);
-    setProgress(0);
-    setSessionId(null);
-
-    try {
-      const fd = new FormData();
-      for (const img of images) {
-        fd.append("images", img);
-      }
-      fd.append("audio", audio);
-      if (music && music.size > 0) {
-        fd.append("music", music);
-      }
-
-      console.log("[client] POST /api/upload");
-      const up = await fetch("/api/upload", { method: "POST", body: fd });
-      const upJson = (await up.json()) as ApiOk & { sessionId?: string };
-      appendLogs(upJson);
-      if (!up.ok || !upJson.ok || !upJson.sessionId) {
-        throw new Error(upJson.error ?? "Upload failed");
-      }
-      const sid = upJson.sessionId;
-      setSessionId(sid);
-      setProgress(30);
-
-      console.log("[client] POST /api/generate-video", sid);
-      const gv = await fetch("/api/generate-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: sid, timedTranscript: timedTranscript.trim() }),
-      });
-      const gvJson = (await gv.json()) as ApiOk & { videoUrl?: string };
-      appendLogs(gvJson);
-      if (!gv.ok || !gvJson.ok || !gvJson.videoUrl) {
-        throw new Error(gvJson.error ?? "Video render failed");
-      }
-      setVideoUrl(`${gvJson.videoUrl}?t=${Date.now()}`);
-      setProgress(100);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error("[client] pipeline", e);
-      setError(msg);
-      setLogs((prev) => [...prev, { level: "error", message: msg }]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const canStoryVideo =
+    !storyLoading &&
+    (storySource === "youtube"
+      ? youtubeUrl.trim().length >= 10
+      : storyText.trim().length >= 20);
+  const selectedBroll = brollOptions.find((b) => b.id === brollId);
 
   return (
     <div className="min-h-full bg-zinc-950 text-zinc-100">
-      <main className="mx-auto flex max-w-2xl flex-col gap-8 px-4 py-12 sm:px-6">
-        <header className="space-y-2">
-          <p className="text-sm font-medium uppercase tracking-[0.2em] text-violet-400">
-            Reeler
-          </p>
-          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
-            AI Shorts generator
-          </h1>
-          <p className="text-zinc-400">
-            Upload your <span className="text-zinc-200">voice-over</span> and images. Paste a
-            transcript with <code className="text-violet-300">(M:SS)</code> timestamps so each segment
-            knows how long to show the next slide and what subtitle to burn in. FFmpeg builds a
-            1920×1080 (16:9) video with hard cuts between slides and small bottom captions.
-          </p>
-        </header>
-
-        <section className="flex flex-col gap-5 rounded-2xl border border-rose-900/40 bg-zinc-900/50 p-6 shadow-xl">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold text-rose-200/90">
-              Story → Remotion Short (VO + karaoke + parkour)
-            </h2>
+      <main className="mx-auto grid max-w-6xl gap-6 px-4 py-8 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start">
+        <div className="flex flex-col gap-5">
+          <header className="space-y-1">
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-rose-400">
+              Reeler
+            </p>
+            <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+              Story → Short
+            </h1>
             <p className="text-sm text-zinc-400">
-              Paste a raw story. Pick <strong className="text-zinc-300">English</strong> or{" "}
-              <strong className="text-zinc-300">Hindi</strong>. Renders a 9:16 Remotion Short
-              (parkour B-roll + VO + karaoke). Only{" "}
-              <code className="text-zinc-500">story.mp4</code> is saved under{" "}
-              <code className="text-zinc-500">public/output</code>.
+              Generate a vertical Short from your story, then upload to YouTube.
+              Live job logs stay on this page.
             </p>
-          </div>
-          <fieldset className="flex flex-wrap gap-3">
-            <legend className="mb-1 w-full text-sm font-medium text-zinc-300">Language</legend>
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40">
-              <input
-                type="radio"
-                name="storyLang"
-                value="en"
-                checked={storyLang === "en"}
-                disabled={storyLoading}
-                onChange={() => setStoryLang("en")}
-                className="accent-rose-500"
-              />
-              English (Kokoro)
-            </label>
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40">
-              <input
-                type="radio"
-                name="storyLang"
-                value="hi"
-                checked={storyLang === "hi"}
-                disabled={storyLoading}
-                onChange={() => setStoryLang("hi")}
-                className="accent-rose-500"
-              />
-              हिंदी Hindi
-            </label>
-          </fieldset>
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Your story</span>
-            <textarea
-              value={storyText}
-              onChange={(e) => {
-                setStoryText(e.target.value);
-                setStoryError(null);
-                setStoryVideoUrl(null);
-              }}
-              disabled={storyLoading}
-              rows={8}
-              placeholder="Write a 30-second horror story about a cabin in the woods…"
-              className="w-full resize-y rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
-            />
-          </label>
-          <button
-            type="button"
-            onClick={() => void runStoryVideo()}
-            disabled={!canStoryVideo}
-            className="rounded-xl bg-rose-700 px-4 py-3 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
-          >
-            {storyLoading ? "Building story video…" : "Generate story video"}
-          </button>
-          {storyLogs.length > 0 && (
-            <pre className="max-h-40 overflow-auto rounded-xl border border-zinc-800 bg-black/40 p-3 font-mono text-xs text-zinc-400">
-              {storyLogs.map((l, i) => (
-                <span key={i} className={l.level === "error" ? "text-red-400" : ""}>
-                  {l.message}
-                  {"\n"}
+          </header>
+
+          <section className="flex flex-col gap-5 rounded-2xl border border-rose-900/40 bg-zinc-900/50 p-5 shadow-xl sm:p-6">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <fieldset className="flex flex-col gap-2">
+                <legend className="text-sm font-medium text-zinc-300">Language</legend>
+                <div className="flex flex-wrap gap-2">
+                  {(
+                    [
+                      ["en", "English"],
+                      ["hi", "Hindi"],
+                    ] as const
+                  ).map(([v, label]) => (
+                    <label
+                      key={v}
+                      className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40"
+                    >
+                      <input
+                        type="radio"
+                        name="storyLang"
+                        checked={storyLang === v}
+                        disabled={storyLoading}
+                        onChange={() => setStoryLang(v)}
+                        className="accent-rose-500"
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              <fieldset className="flex flex-col gap-2">
+                <legend className="text-sm font-medium text-zinc-300">Voice</legend>
+                <div className="flex flex-wrap gap-2">
+                  {(
+                    [
+                      ["female", "Female"],
+                      ["male", "Male"],
+                    ] as const
+                  ).map(([v, label]) => (
+                    <label
+                      key={v}
+                      className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40"
+                    >
+                      <input
+                        type="radio"
+                        name="voiceGender"
+                        checked={voiceGender === v}
+                        disabled={storyLoading}
+                        onChange={() => setVoiceGender(v)}
+                        className="accent-rose-500"
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+            </div>
+
+            <fieldset className="flex flex-col gap-2">
+              <legend className="text-sm font-medium text-zinc-300">
+                Playback speed
+              </legend>
+              <div className="flex flex-wrap gap-2">
+                {SPEED_PRESETS.map((p) => (
+                  <label
+                    key={p.id}
+                    className="inline-flex min-w-[6.5rem] cursor-pointer flex-col rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40"
+                  >
+                    <span className="inline-flex items-center gap-2 font-medium">
+                      <input
+                        type="radio"
+                        name="storySpeed"
+                        checked={storySpeed === p.id}
+                        disabled={storyLoading}
+                        onChange={() => setStorySpeed(p.id)}
+                        className="accent-rose-500"
+                      />
+                      {p.label}
+                    </span>
+                    <span className="pl-6 text-[11px] text-zinc-500">{p.hint}</span>
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-zinc-500">
+                Auto raises speed if needed so the Short stays under 2:59 for YouTube.
+              </p>
+            </fieldset>
+
+            <label className="flex flex-col gap-2">
+              <span className="text-sm font-medium text-zinc-300">B-roll background</span>
+              <select
+                value={brollId}
+                disabled={storyLoading || brollOptions.length === 0}
+                onChange={(e) => setBrollId(e.target.value)}
+                className="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-200 focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
+              >
+                {brollOptions.length === 0 && <option value="">Loading clips…</option>}
+                {brollOptions.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    [{opt.kind}] {opt.label}
+                  </option>
+                ))}
+              </select>
+              {selectedBroll && (
+                <span className="text-xs text-zinc-500">
+                  Selected: <span className="text-zinc-300">{selectedBroll.label}</span>{" "}
+                  ({selectedBroll.kind}) — FFmpeg seeks a random trim only
                 </span>
-              ))}
-            </pre>
-          )}
-          {storyError && (
-            <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {storyError}
-            </p>
-          )}
-          {storyVideoUrl && (
-            <div className="flex flex-col gap-3">
-              {storyTitle && (
-                <p className="text-sm font-medium text-rose-100/90">{storyTitle}</p>
               )}
+            </label>
+
+            <label className="flex flex-col gap-2">
+              <span className="text-sm font-medium text-zinc-300">Story input</span>
+              <div className="flex flex-wrap gap-2">
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40">
+                  <input
+                    type="radio"
+                    name="storySource"
+                    checked={storySource === "manual"}
+                    disabled={storyLoading}
+                    onChange={() => setStorySource("manual")}
+                    className="accent-rose-500"
+                  />
+                  Manual paste
+                </label>
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40">
+                  <input
+                    type="radio"
+                    name="storySource"
+                    checked={storySource === "youtube"}
+                    disabled={storyLoading}
+                    onChange={() => setStorySource("youtube")}
+                    className="accent-rose-500"
+                  />
+                  YouTube link
+                </label>
+              </div>
+            </label>
+
+            {storySource === "youtube" ? (
+              <label className="flex flex-col gap-2">
+                <span className="text-sm font-medium text-zinc-300">YouTube URL</span>
+                <input
+                  type="url"
+                  value={youtubeUrl}
+                  onChange={(e) => {
+                    setYoutubeUrl(e.target.value);
+                    setStoryError(null);
+                  }}
+                  disabled={storyLoading}
+                  placeholder="https://www.youtube.com/watch?v=… or shorts/…"
+                  className="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
+                />
+                <span className="text-xs text-zinc-500">
+                  Pulls captions via youtube-transcript, then the planner retells that
+                  transcript like a pasted story. Needs captions on the video.
+                </span>
+              </label>
+            ) : (
+              <label className="flex flex-col gap-2">
+                <span className="flex items-center justify-between text-sm font-medium text-zinc-300">
+                  Your story
+                  <span className="font-normal text-zinc-500">
+                    {storyText.trim().length} chars
+                  </span>
+                </span>
+                <textarea
+                  value={storyText}
+                  onChange={(e) => {
+                    setStoryText(e.target.value);
+                    setStoryError(null);
+                  }}
+                  disabled={storyLoading}
+                  rows={12}
+                  placeholder="Paste the full story you want retold as a first-person Short…"
+                  className="w-full resize-y rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-3 text-sm leading-relaxed text-zinc-200 placeholder:text-zinc-600 focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
+                />
+              </label>
+            )}
+
+            <button
+              type="button"
+              onClick={() => void runStoryVideo()}
+              disabled={!canStoryVideo}
+              className="rounded-xl bg-rose-700 px-4 py-3.5 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
+            >
+              {storyLoading ? "Building story video…" : "Generate story video"}
+            </button>
+
+            {storyError && (
+              <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
+                {storyError}
+              </p>
+            )}
+          </section>
+        </div>
+
+        <aside className="flex flex-col gap-4 lg:sticky lg:top-6">
+          <section className="flex flex-col gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-zinc-200">Live job log</h2>
+              {storyLoading && (
+                <span className="animate-pulse text-xs text-rose-300">running…</span>
+              )}
+            </div>
+            <div className="max-h-[min(52vh,520px)] min-h-[220px] overflow-auto rounded-xl border border-zinc-800 bg-black/50 p-3 font-mono text-[11px] leading-5 text-zinc-400">
+              {storyLogs.length === 0 ? (
+                <p className="text-zinc-600">Logs appear here when you generate.</p>
+              ) : (
+                storyLogs.map((l, i) => (
+                  <div
+                    key={i}
+                    className={l.level === "error" ? "text-red-400" : "text-zinc-400"}
+                  >
+                    {l.message}
+                  </div>
+                ))
+              )}
+              <div ref={logEndRef} />
+            </div>
+          </section>
+
+          <section className="flex flex-col gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
+            <h2 className="text-sm font-semibold text-zinc-200">Preview & publish</h2>
+
+            {storyMeta && (
+              <dl className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-lg bg-black/40 px-2.5 py-2">
+                  <dt className="text-zinc-500">Duration</dt>
+                  <dd className="font-medium text-zinc-100">
+                    {formatDuration(storyMeta.durationSec)}
+                  </dd>
+                </div>
+                <div className="rounded-lg bg-black/40 px-2.5 py-2">
+                  <dt className="text-zinc-500">Renderer</dt>
+                  <dd className="font-medium text-zinc-100">
+                    {storyMeta.renderer ?? "—"}
+                  </dd>
+                </div>
+                <div className="col-span-2 rounded-lg bg-black/40 px-2.5 py-2">
+                  <dt className="text-zinc-500">B-roll</dt>
+                  <dd className="font-medium text-zinc-100">
+                    {storyMeta.brollSource ?? "—"}
+                  </dd>
+                </div>
+              </dl>
+            )}
+
+            {storyTitle && (
+              <p className="text-sm font-medium text-rose-100/90">{storyTitle}</p>
+            )}
+
+            {storyVideoUrl ? (
               <video
                 key={storyVideoUrl}
                 src={storyVideoUrl}
                 controls
                 playsInline
-                className="mx-auto aspect-[9/16] w-full max-w-sm rounded-lg border border-zinc-700 bg-black"
+                className="mx-auto aspect-[9/16] w-full max-w-xs rounded-lg border border-zinc-700 bg-black"
               />
+            ) : (
+              <div className="flex aspect-[9/16] w-full max-w-xs flex-col items-center justify-center self-center rounded-lg border border-dashed border-zinc-700 bg-black/30 text-center text-xs text-zinc-600">
+                Preview appears after generate
+              </div>
+            )}
+
+            {storyVideoUrl && (
               <a
                 href={storyVideoUrl.split("?")[0]}
                 download="story.mp4"
@@ -515,353 +505,97 @@ export default function Home() {
               >
                 Download story MP4
               </a>
-              <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-black/30 p-3">
-                <p className="text-xs text-zinc-400">
-                  YouTube Shorts (9:16 + #Shorts){" "}
-                  {ytConnected ? (
-                    <span className="text-emerald-400">
-                      · connected{ytChannel ? ` as ${ytChannel}` : ""}
-                    </span>
-                  ) : (
-                    <span className="text-amber-400">· not connected</span>
-                  )}
-                </p>
-                {!ytConnected ? (
-                  <a
-                    href="/auth/youtube"
-                    className="inline-flex items-center justify-center rounded-xl bg-red-700 px-4 py-2 text-center text-sm font-semibold text-white hover:bg-red-600"
-                  >
-                    Connect YouTube (one-time)
-                  </a>
-                ) : (
-                  <>
-                    <label className="flex flex-col gap-1 text-xs text-zinc-400">
-                      Privacy
-                      <select
-                        value={ytPrivacy}
-                        onChange={(e) =>
-                          setYtPrivacy(e.target.value as "private" | "unlisted" | "public")
-                        }
-                        disabled={ytUploading}
-                        className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-200"
-                      >
-                        <option value="private">Private</option>
-                        <option value="unlisted">Unlisted</option>
-                        <option value="public">Public</option>
-                      </select>
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => void uploadStoryToYoutube()}
-                      disabled={ytUploading}
-                      className="rounded-xl bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-zinc-700"
-                    >
-                      {ytUploading ? "Uploading Short…" : "Upload as YouTube Short"}
-                    </button>
-                  </>
-                )}
-                {ytError && <p className="text-xs text-red-300">{ytError}</p>}
-                {ytUrl && (
-                  <a
-                    href={ytUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs text-rose-300 underline"
-                  >
-                    Open Short on YouTube
-                  </a>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-
-        <section className="flex flex-col gap-5 rounded-2xl border border-zinc-800 bg-zinc-900/50 p-6 shadow-xl">
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Images (slide order = A→Z by file name)</span>
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              multiple
-              onChange={onImagesChange}
-              disabled={loading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-violet-600 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-violet-500"
-            />
-            {images.length > 0 && (
-              <span className="text-xs text-zinc-500">{images.length} file(s) selected</span>
             )}
-          </label>
 
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Narration audio</span>
-            <input
-              type="file"
-              accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
-              onChange={onAudioChange}
-              disabled={loading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-violet-600 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-violet-500"
-            />
-            {audio && (
-              <span className="truncate text-xs text-zinc-500">{audio.name}</span>
-            )}
-          </label>
-
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">
-              Timed transcript <span className="font-normal text-zinc-500">(slide + subtitle timing)</span>
-            </span>
-            <textarea
-              value={timedTranscript}
-              onChange={(e) => {
-                setTimedTranscript(e.target.value);
-                setError(null);
-                setVideoUrl(null);
-              }}
-              disabled={loading}
-              rows={10}
-              placeholder={`(0:00) First line of narration…\n(0:05) Next beat…\n(0:09) Match timestamps roughly to your voice-over recording.`}
-              className="w-full resize-y rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-            />
-            <span className="text-xs text-zinc-500">
-              Each <code className="text-zinc-400">(M:SS)</code> starts a new segment: that duration maps
-              to the next image in <strong className="text-zinc-400">A→Z file name</strong> order (images repeat if there are more segments than images).
-            </span>
-          </label>
-
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">
-              Background music <span className="font-normal text-zinc-500">(optional)</span>
-            </span>
-            <input
-              type="file"
-              accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
-              onChange={onMusicChange}
-              disabled={loading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-zinc-700 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-zinc-600"
-            />
-          </label>
-
-          <button
-            type="button"
-            onClick={() => void runPipeline()}
-            disabled={!canGenerate}
-            className="rounded-xl bg-violet-600 px-4 py-3 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
-          >
-            {loading ? "Working…" : "Generate video"}
-          </button>
-
-          {loading && (
-            <div className="space-y-2">
-              <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
-                <div
-                  className="h-full rounded-full bg-violet-500 transition-[width] duration-500"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <p className="text-xs text-zinc-500">
-                Rough progress (upload → encode). See logs for detail.
-              </p>
-            </div>
-          )}
-
-          {error && (
-            <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {error}
-            </p>
-          )}
-        </section>
-
-        <section className="flex flex-col gap-5 rounded-2xl border border-amber-900/40 bg-zinc-900/50 p-6 shadow-xl">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold text-amber-200/90">Storyboard → scenes (separate tool)</h2>
-            <p className="text-sm text-zinc-400">
-              Upload one or more <strong className="text-zinc-300">3×3 grid</strong> storyboard sheets (same
-              layout as Amazon-style boards). Each sheet is split into 9 PNGs in <strong className="text-zinc-300">A→Z file name</strong> order; all scenes are numbered sequentially{" "}
-              <code className="text-amber-300/90">scene_001.png</code> … and packed into one{" "}
-              <code className="text-amber-300/90">storyboard-scenes.zip</code> download.
-            </p>
-          </div>
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Storyboard images</span>
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              multiple
-              onChange={onStoryboardsChange}
-              disabled={cropLoading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-amber-700 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-amber-600"
-            />
-            {storyboards.length > 0 && (
-              <span className="text-xs text-zinc-500">{storyboards.length} sheet(s) selected</span>
-            )}
-          </label>
-          <button
-            type="button"
-            onClick={() => void runStoryboardCrop()}
-            disabled={!canCropStoryboards}
-            className="rounded-xl bg-amber-700 px-4 py-3 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
-          >
-            {cropLoading ? "Cropping…" : "Download scenes (.zip)"}
-          </button>
-          {cropError && (
-            <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {cropError}
-            </p>
-          )}
-        </section>
-
-        <section className="flex flex-col gap-5 rounded-2xl border border-cyan-900/40 bg-zinc-900/50 p-6 shadow-xl">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold text-cyan-200/90">Batch 2× upscale (separate tool)</h2>
-            <p className="text-sm text-zinc-400">
-              Upload many images at once. Each file is processed in <strong className="text-zinc-300">A→Z</strong>{" "}
-              order, scaled to <strong className="text-zinc-300">double width and height</strong> using a
-              high-quality Lanczos resize (fast, runs fully on the server — not a generative AI model).{" "}
-              <strong className="text-zinc-300">JPEG / PNG / WebP</strong> stay the same type;{" "}
-              <strong className="text-zinc-300">GIF</strong> becomes a single PNG frame. Everything is returned
-              in one <code className="text-cyan-300/90">upscaled-2x.zip</code> (filenames like{" "}
-              <code className="text-cyan-300/90">photo_2x.jpg</code>). For Real-ESRGAN-class AI upscaling, wire a
-              native binary separately — this path is meant for reliable batch work in Node.
-            </p>
-          </div>
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Images to upscale</span>
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              multiple
-              onChange={onUpscaleFilesChange}
-              disabled={upscaleLoading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-cyan-700 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-cyan-600"
-            />
-            {upscaleFiles.length > 0 && (
-              <span className="text-xs text-zinc-500">{upscaleFiles.length} file(s) selected</span>
-            )}
-          </label>
-          <button
-            type="button"
-            onClick={() => void runUpscaleBatch()}
-            disabled={!canUpscaleBatch}
-            className="rounded-xl bg-cyan-700 px-4 py-3 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-cyan-600 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
-          >
-            {upscaleLoading ? "Upscaling…" : "Download upscaled-2x.zip"}
-          </button>
-          {upscaleError && (
-            <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {upscaleError}
-            </p>
-          )}
-        </section>
-
-        <section className="flex flex-col gap-5 rounded-2xl border border-lime-900/40 bg-zinc-900/50 p-6 shadow-xl">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold text-lime-300/90">
-              Transcribe + TikTok captions (Whisper Web)
-            </h2>
-            <p className="text-sm text-zinc-400">
-              Free on-device transcription via{" "}
-              <code className="text-lime-300/80">@remotion/whisper-web</code> (
-              <code className="text-zinc-500">tiny.en</code>), then{" "}
-              <code className="text-lime-300/80">toCaptions()</code> →{" "}
-              <code className="text-lime-300/80">createTikTokStyleCaptions</code> and burn-in with
-              active-word highlight <span className="font-semibold text-[#39E508]">#39E508</span>.
-              First run downloads the model in your browser — keep this tab open.
-            </p>
-          </div>
-          <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-zinc-300">Video file</span>
-            <input
-              type="file"
-              accept="video/mp4,video/webm,video/quicktime,.mp4,.mov,.webm,.mkv,.m4v"
-              onChange={onCaptionVideoChange}
-              disabled={captionLoading}
-              className="block w-full text-sm text-zinc-300 file:mr-4 file:rounded-lg file:border-0 file:bg-lime-700 file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-lime-600"
-            />
-            {captionVideoFile && (
-              <span className="truncate text-xs text-zinc-500">{captionVideoFile.name}</span>
-            )}
-          </label>
-          <button
-            type="button"
-            onClick={() => void runCaptionVideo()}
-            disabled={!canCaptionVideo}
-            className="rounded-xl bg-lime-700 px-4 py-3 text-center text-sm font-semibold text-white shadow-lg transition hover:bg-lime-600 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
-          >
-            {captionLoading ? "Working…" : "Transcribe & caption"}
-          </button>
-          {captionStatus && (
-            <p className="text-sm text-lime-200/80">{captionStatus}</p>
-          )}
-          {captionError && (
-            <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {captionError}
-            </p>
-          )}
-          {captionedUrl && (
-            <div className="flex flex-col gap-3">
-              <video
-                key={captionedUrl}
-                src={captionedUrl}
-                controls
-                playsInline
-                className="mx-auto aspect-video w-full max-w-3xl rounded-lg border border-zinc-700 bg-black"
-              />
-              <a
-                href={captionedUrl.split("?")[0]}
-                download="captioned.mp4"
-                className="inline-flex items-center justify-center rounded-xl border border-lime-800 bg-zinc-800 px-4 py-2 text-center text-sm font-medium text-white hover:bg-zinc-700"
-              >
-                Download captioned MP4
-              </a>
-            </div>
-          )}
-        </section>
-
-        <section className="flex flex-col gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
-            Progress logs
-          </h2>
-          <pre className="max-h-64 overflow-auto rounded-xl border border-zinc-800 bg-black/40 p-4 font-mono text-xs leading-relaxed text-zinc-300">
-            {logs.length === 0
-              ? "Logs appear here after you run the pipeline."
-              : logs.map((l, i) => (
-                  <span key={`${i}-${l.message}`} className={l.level === "error" ? "text-red-400" : ""}>
-                    {l.progress != null ? `[${l.progress}%] ` : ""}
-                    {l.message}
-                    {"\n"}
+            <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-black/30 p-3">
+              <p className="text-xs text-zinc-400">
+                YouTube Shorts{" "}
+                {ytConnected ? (
+                  <span className="text-emerald-400">
+                    · connected{ytChannel ? ` as ${ytChannel}` : ""}
                   </span>
-                ))}
-          </pre>
-        </section>
-
-        {videoUrl && sessionId && (
-          <section className="flex flex-col gap-4 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
-            <h2 className="text-lg font-semibold">Preview</h2>
-            <video
-              key={videoUrl}
-              src={videoUrl}
-              controls
-              playsInline
-              className="mx-auto aspect-video w-full max-w-3xl rounded-lg border border-zinc-700 bg-black"
-            />
-            <a
-              href={videoUrl.split("?")[0]}
-              download={`reeler-${sessionId.slice(0, 8)}.mp4`}
-              className="inline-flex items-center justify-center rounded-xl border border-zinc-600 bg-zinc-800 px-4 py-2 text-center text-sm font-medium text-white hover:bg-zinc-700"
-            >
-              Download MP4
-            </a>
+                ) : (
+                  <span className="text-amber-400">· not connected</span>
+                )}
+              </p>
+              {!ytConnected ? (
+                <a
+                  href="/auth/youtube"
+                  className="inline-flex items-center justify-center rounded-xl bg-red-700 px-4 py-2 text-center text-sm font-semibold text-white hover:bg-red-600"
+                >
+                  Connect YouTube
+                </a>
+              ) : (
+                <>
+                  <label className="flex flex-col gap-1 text-xs text-zinc-400">
+                    Privacy
+                    <select
+                      value={ytPrivacy}
+                      onChange={(e) =>
+                        setYtPrivacy(
+                          e.target.value as "private" | "unlisted" | "public"
+                        )
+                      }
+                      disabled={ytUploading || !storyVideoUrl}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-200"
+                    >
+                      <option value="private">Private</option>
+                      <option value="unlisted">Unlisted</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void uploadStoryToYoutube()}
+                    disabled={ytUploading || !storyVideoUrl}
+                    className="rounded-xl bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-zinc-700"
+                  >
+                    {ytUploading ? "Uploading Short…" : "Upload as YouTube Short"}
+                  </button>
+                </>
+              )}
+              {ytError && <p className="text-xs text-red-300">{ytError}</p>}
+              {ytUrl && (
+                <a
+                  href={ytUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-rose-300 underline"
+                >
+                  Open Short on YouTube
+                </a>
+              )}
+            </div>
           </section>
-        )}
 
-        <footer className="border-t border-zinc-800 pt-8 text-xs text-zinc-500">
-          <p>
-            FFmpeg is bundled via <code className="rounded bg-zinc-800 px-1">ffmpeg-static</code> (override
-            with <code className="rounded bg-zinc-800 px-1">FFMPEG_PATH</code>). No Whisper — timings come
-            from your pasted transcript. See <code className="rounded bg-zinc-800 px-1">SETUP.md</code>.
-          </p>
-        </footer>
+          {storyPlan?.fullNarration && (
+            <section className="flex flex-col gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
+              <h2 className="text-sm font-semibold text-zinc-200">Spoken narration</h2>
+              {storyPlan.hook && (
+                <p className="text-xs text-rose-200/80">Hook: {storyPlan.hook}</p>
+              )}
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-xl border border-zinc-800 bg-black/40 p-3 text-xs leading-relaxed text-zinc-400">
+                {storyPlan.fullNarration}
+              </pre>
+              {storyPlan.endingQuestion && (
+                <p className="text-xs text-zinc-500">
+                  Ending: {storyPlan.endingQuestion}
+                </p>
+              )}
+              {storyPlan.scenes && (
+                <p className="text-xs text-zinc-600">
+                  {storyPlan.scenes.length} scene chunk(s) in plan
+                </p>
+              )}
+            </section>
+          )}
+        </aside>
       </main>
+
+      {/*
+        Legacy tools (image slideshow / crop / upscale / caption burn) removed from UI.
+        APIs remain if needed later.
+      */}
     </div>
   );
 }

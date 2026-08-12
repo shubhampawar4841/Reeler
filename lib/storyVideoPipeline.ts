@@ -8,7 +8,10 @@ import { getFfmpegExecutable } from "@/lib/binPaths";
 import { VIDEO_FPS } from "@/lib/ffmpeg";
 import { buildAssFromVoiceCaptions } from "@/lib/dummyCaptions";
 import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
-import { synthesizeStoryVoice } from "@/lib/kokoroTts";
+import {
+  synthesizeStoryVoice,
+  type VoiceGender,
+} from "@/lib/kokoroTts";
 import { alignVoiceCaptions } from "@/lib/alignVoiceCaptions";
 import type { StoryPlan, StoryScene } from "@/lib/storyTypes";
 import { getStoryRendererMode } from "@/lib/remotion/renderStory";
@@ -16,6 +19,13 @@ import {
   mapPipelineToInput,
   type BrollPoolItem,
 } from "@/lib/remotion/mapPipelineToInput";
+import {
+  brollFfmpegInput,
+  findBrollById,
+  listBrollCatalog,
+  REMOTE_BROLL,
+  type BrollCatalogItem,
+} from "@/lib/brollCatalog";
 
 export type StoryVideoLog = (msg: string) => void;
 
@@ -33,14 +43,60 @@ const ENCODE_MAXRATE = "3.5M";
 const ENCODE_BUFSIZE = "7M";
 const ENCODE_AUDIO_BITRATE = "64k";
 
+/** YouTube Shorts: over 3:00 is treated as a regular video — stay under. */
+export const MAX_SHORTS_DURATION_SEC = 179;
+
 /**
- * Whole Short playback speed (B-roll + VO + captions together).
- * Env: STORY_SPEED (1–2). Default 1.35.
+ * Preferred whole-Short speed (B-roll + VO + captions).
+ * Env STORY_SPEED used when UI doesn't pass a value.
  */
-function resolvePlaybackSpeed(): number {
+function resolveBasePlaybackSpeed(preferred?: number | null): number {
+  if (preferred != null && Number.isFinite(preferred) && preferred >= 1 && preferred <= 2.5) {
+    return preferred;
+  }
   const raw = Number(process.env.STORY_SPEED ?? process.env.BROLL_SPEED);
   if (Number.isFinite(raw) && raw >= 1 && raw <= 2) return raw;
   return 1.35;
+}
+
+/**
+ * Speed so final duration ≤ MAX_SHORTS_DURATION_SEC while keeping full narration.
+ * When autoFit is true (default), raises speed to fit ≤179s. Max 3.5×.
+ */
+function resolveShortsPlaybackSpeed(
+  voiceSec: number,
+  onLog?: StoryVideoLog,
+  opts?: { preferredSpeed?: number | null; autoFit?: boolean }
+): number {
+  const maxSec = Math.min(
+    179,
+    Math.max(60, Number(process.env.MAX_SHORTS_SEC) || MAX_SHORTS_DURATION_SEC)
+  );
+  const autoFit = opts?.autoFit !== false;
+  const base = resolveBasePlaybackSpeed(opts?.preferredSpeed);
+  const voiceIn = Math.max(0.2, voiceSec);
+  const atBase = voiceIn / base;
+
+  if (!autoFit || atBase <= maxSec + 0.05) {
+    onLog?.(
+      `Shorts speed ${base.toFixed(2)}× → ~${atBase.toFixed(1)}s` +
+        (autoFit ? ` (cap ${maxSec}s)` : " (auto-fit off)")
+    );
+    return base;
+  }
+
+  const needed = voiceIn / maxSec;
+  const speed = Math.min(3.5, Math.max(base, needed));
+  const outSec = voiceIn / speed;
+  onLog?.(
+    `Shorts auto-fit: ${base.toFixed(2)}× → ${speed.toFixed(2)}× so ${voiceIn.toFixed(1)}s VO → ~${outSec.toFixed(1)}s (≤${maxSec}s)`
+  );
+  if (outSec > maxSec + 0.25) {
+    onLog?.(
+      `Warning: even @ ${speed.toFixed(2)}× output ~${outSec.toFixed(1)}s may exceed Shorts limit`
+    );
+  }
+  return speed;
 }
 
 /** atempo only accepts 0.5–2.0 per filter; chain for safety. */
@@ -76,19 +132,22 @@ function scaleCaptionsForSpeed(captions: Caption[], speed: number): Caption[] {
   }));
 }
 
-/** Remote B-roll (downloaded into the job temp dir each run). */
-export const DEFAULT_STORY_BROLL_URLS = [
-  // "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-1.mp4",
-  // "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/minecraft-parkour-2.mp4",
-  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/(No%20Copyright)Satisfying%20Videos%20Reel_Shorts%20format%20Satisfying%20Videos%20for%20Repost%20-%20Killing%20tech%20(480p,%20h264)%20(1).mp4",
-  "https://xoeejvzsafcxjkgkfunu.supabase.co/storage/v1/object/public/meow/(No%20Copyright)Satisfying%20Videos%20Reel_Shorts%20format%20Satisfying%20Videos%20for%20Repost%20-%20Killing%20tech%20(480p,%20h264).mp4",
-] as const;
+/** Remote B-roll URLs (mirrors REMOTE_BROLL). */
+export const DEFAULT_STORY_BROLL_URLS = REMOTE_BROLL.map((r) => r.src);
 
 export type BuildStoryVideoOptions = {
   story: string;
   lang?: StoryLang;
-  /** Optional local override; otherwise downloads DEFAULT_STORY_BROLL_URLS */
+  /** Absolute path from multipart upload */
   backgroundVideoPath?: string | null;
+  /** Catalog id from listBrollCatalog() e.g. local:….mp4 or remote:… */
+  brollId?: string | null;
+  /** male | female — maps to Kokoro / Edge voice */
+  voiceGender?: VoiceGender | null;
+  /** Preferred playback speed (1–2.5). Auto-raised to fit Shorts ≤3:00 unless autoFitSpeed=false. */
+  storySpeed?: number | null;
+  /** When true (default), bump speed so output ≤ 2:59. */
+  autoFitSpeed?: boolean;
   onLog?: StoryVideoLog;
 };
 
@@ -106,20 +165,63 @@ type PreparedStoryAssets = {
   usedUpload: boolean;
   poolLabel: string;
   lang: StoryLang;
+  storySpeed: number | null;
+  autoFitSpeed: boolean;
 };
 
-async function downloadBrollUrl(
-  url: string,
-  dest: string,
-  onLog?: StoryVideoLog
-): Promise<void> {
-  onLog?.(`Downloading B-roll ${path.basename(dest)}…`);
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to download B-roll (${res.status}): ${url}`);
+/** Resolve one B-roll source — prefer seekable local/URL, never full remote download. */
+async function resolveBrollPool(
+  options: BuildStoryVideoOptions,
+  onLog: StoryVideoLog
+): Promise<{ poolMeta: BrollPoolItem[]; usedUpload: boolean; poolLabel: string }> {
+  const uploadPath = options.backgroundVideoPath?.trim() || "";
+  if (uploadPath) {
+    await fs.access(uploadPath);
+    const dur = await probeDurationSec(uploadPath);
+    const label = path.basename(uploadPath);
+    onLog(`B-roll: uploaded file ${label} (${dur.toFixed(0)}s) — seek trim only`);
+    return {
+      usedUpload: true,
+      poolLabel: label,
+      poolMeta: [{ path: uploadPath, dur, label }],
+    };
   }
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fs.writeFile(dest, buf);
+
+  const catalog = await listBrollCatalog();
+  let picked: BrollCatalogItem | null = findBrollById(
+    catalog,
+    options.brollId
+  );
+
+  if (!picked) {
+    picked = catalog[Math.floor(Math.random() * catalog.length)] ?? null;
+    if (picked) {
+      onLog(`B-roll: auto-picked "${picked.label}" (${picked.kind})`);
+    }
+  } else {
+    onLog(`B-roll: selected "${picked.label}" (${picked.kind})`);
+  }
+
+  if (!picked) {
+    throw new Error(
+      "No B-roll available. Configure REMOTE_BROLL in lib/brollCatalog.ts (or set BROLL_INCLUDE_LOCAL=1)."
+    );
+  }
+
+  const ffmpegSrc = brollFfmpegInput(picked);
+  onLog(
+    picked.kind === "local"
+      ? `Seeking local file (no copy): ${picked.src}`
+      : `Seeking remote URL (no full download): ${picked.id}`
+  );
+  const dur = await probeDurationSec(ffmpegSrc);
+  onLog(`B-roll duration ${dur.toFixed(1)}s — FFmpeg will -ss / -t the needed window only`);
+
+  return {
+    usedUpload: false,
+    poolLabel: picked.label,
+    poolMeta: [{ path: ffmpegSrc, dur, label: picked.label }],
+  };
 }
 
 function escapePathForFilter(p: string): string {
@@ -178,6 +280,7 @@ function parseBitrateKbps(stderr: string): number | null {
 async function probeMedia(
   filePath: string
 ): Promise<{ durationSec: number; bitrateKbps: number | null; sizeBytes: number }> {
+  const isRemote = /^https?:\/\//i.test(filePath);
   const stderr = await new Promise<string>((resolve, reject) => {
     execFile(
       getFfmpegExecutable(),
@@ -194,18 +297,25 @@ async function probeMedia(
   if (durationSec == null) {
     throw new Error(`No Duration for ${path.basename(filePath)}`);
   }
-  const stat = await fs.stat(filePath);
+  let sizeBytes = 0;
+  if (!isRemote) {
+    try {
+      sizeBytes = (await fs.stat(filePath)).size;
+    } catch {
+      sizeBytes = 0;
+    }
+  }
   const fromContainer = stderr.match(/bitrate:\s*([\d.]+)\s*kb\/s/i);
   const bitrateKbps = fromContainer
     ? Number(fromContainer[1])
-    : durationSec > 0
-      ? (stat.size * 8) / durationSec / 1000
+    : durationSec > 0 && sizeBytes > 0
+      ? (sizeBytes * 8) / durationSec / 1000
       : null;
   return {
     durationSec,
     bitrateKbps:
       bitrateKbps != null && Number.isFinite(bitrateKbps) ? bitrateKbps : null,
-    sizeBytes: stat.size,
+    sizeBytes,
   };
 }
 
@@ -271,7 +381,8 @@ async function encodeStoryOnePass(args: {
   } = args;
 
   const voiceIn = Math.max(0.2, voiceSec);
-  const outDur = voiceIn / speed;
+  // Hard Shorts ceiling — never emit ≥ 3:00 even with rounding drift.
+  const outDur = Math.min(voiceIn / speed, MAX_SHORTS_DURATION_SEC);
   // Consume speed× source so after setpts it matches outDur.
   const sourceNeed = voiceIn;
   const canTrim = brollDurSec >= sourceNeed + 0.05;
@@ -289,9 +400,12 @@ async function encodeStoryOnePass(args: {
 
   const srcProbe = await probeMedia(brollPath);
   onLog(
-    `Encode BEFORE (source B-roll): size=${formatMb(srcProbe.sizeBytes)}, ` +
-      `dur=${srcProbe.durationSec.toFixed(1)}s, ` +
-      `avgBitrate=${srcProbe.bitrateKbps != null ? `${srcProbe.bitrateKbps.toFixed(0)} kbps` : "n/a"}`
+    `Encode BEFORE (source B-roll): ` +
+      (srcProbe.sizeBytes > 0 ? `size=${formatMb(srcProbe.sizeBytes)}, ` : "") +
+      `dur=${srcProbe.durationSec.toFixed(1)}s` +
+      (srcProbe.bitrateKbps != null
+        ? `, avgBitrate=${srcProbe.bitrateKbps.toFixed(0)} kbps`
+        : "")
   );
   onLog(
     `Encode settings: preset=${ENCODE_PRESET} crf=${ENCODE_CRF} maxrate=${ENCODE_MAXRATE} ` +
@@ -377,13 +491,13 @@ async function encodeStoryOnePass(args: {
 }
 
 /**
- * Shared prep: B-roll download, Groq plan, TTS, Whisper captions.
+ * Shared prep: B-roll resolve (seek-only), plan, TTS, Whisper captions.
  * Rendering (FFmpeg vs Remotion) happens after this.
  */
 async function prepareStoryAssets(
   options: BuildStoryVideoOptions
 ): Promise<PreparedStoryAssets> {
-  const { story, lang = "en", onLog = console.log } = options;
+  const { story, lang = "en", onLog = console.log, voiceGender } = options;
   const jobId = uuidv4();
   const workDir = path.join(os.tmpdir(), "reeler-story", jobId);
   await fs.mkdir(workDir, { recursive: true });
@@ -391,59 +505,33 @@ async function prepareStoryAssets(
   await fs.mkdir(outDir, { recursive: true });
   const outPath = path.join(outDir, "story.mp4");
 
-  const uploadPath = options.backgroundVideoPath?.trim() || "";
-  const usedUpload = Boolean(uploadPath);
+  const storySpeed =
+    options.storySpeed != null && Number.isFinite(options.storySpeed)
+      ? Number(options.storySpeed)
+      : null;
+  const autoFitSpeed = options.autoFitSpeed !== false;
 
-  const poolMeta: BrollPoolItem[] = [];
-  if (usedUpload) {
-    try {
-      await fs.access(uploadPath);
-      poolMeta.push({
-        path: uploadPath,
-        dur: await probeDurationSec(uploadPath),
-        label: path.basename(uploadPath),
-      });
-    } catch {
-      throw new Error(`B-roll upload missing: ${uploadPath}`);
-    }
-  } else {
-    for (let i = 0; i < DEFAULT_STORY_BROLL_URLS.length; i++) {
-      const url = DEFAULT_STORY_BROLL_URLS[i]!;
-      const dest = path.join(workDir, `broll-${i + 1}.mp4`);
-      try {
-        await downloadBrollUrl(url, dest, onLog);
-        poolMeta.push({
-          path: dest,
-          dur: await probeDurationSec(dest),
-          label: path.basename(new URL(url).pathname),
-        });
-      } catch (err) {
-        onLog?.(
-          `Skipping B-roll part ${i + 1}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
-    if (poolMeta.length === 0) {
-      throw new Error(
-        "Failed to download B-roll from Supabase. Check DEFAULT_STORY_BROLL_URLS."
-      );
-    }
-  }
+  const { poolMeta, usedUpload, poolLabel } = await resolveBrollPool(
+    options,
+    onLog
+  );
 
-  onLog(`Planning storyboard with Groq (${lang === "hi" ? "Hindi" : "English"})…`);
+  onLog(`Planning storyboard with Gemini→Groq (${lang === "hi" ? "Hindi" : "English"})…`);
   const plan = await planStoryWithGroq(story, lang);
   onLog(`Plan ready: "${plan.title}" · ${plan.scenes.length} scene(s)`);
 
+  const gender = voiceGender === "male" || voiceGender === "female" ? voiceGender : "female";
   onLog(
     lang === "hi"
-      ? "Synthesizing Hindi voice-over…"
-      : "Synthesizing English Kokoro voice-over…"
+      ? `Synthesizing Hindi voice-over (${gender})…`
+      : `Synthesizing English Kokoro voice-over (${gender})…`
   );
   const voice = await synthesizeStoryVoice(
     plan.fullNarration,
     path.join(workDir, "voice"),
     lang,
-    onLog
+    onLog,
+    { gender }
   );
   const voicePath = voice.path;
   const voiceSec =
@@ -459,7 +547,6 @@ async function prepareStoryAssets(
   });
 
   const sceneDurations = sceneDurationsForVoice(plan, voiceSec);
-  const poolLabel = poolMeta.map((m) => m.label).join(" + ");
 
   return {
     jobId,
@@ -475,6 +562,8 @@ async function prepareStoryAssets(
     usedUpload,
     poolLabel,
     lang,
+    storySpeed,
+    autoFitSpeed,
   };
 }
 
@@ -493,7 +582,10 @@ async function renderWithFfmpeg(
     lang,
   } = prepared;
 
-  const speed = resolvePlaybackSpeed();
+  const speed = resolveShortsPlaybackSpeed(voiceSec, onLog, {
+    preferredSpeed: prepared.storySpeed,
+    autoFit: prepared.autoFitSpeed,
+  });
   const timedCaptions = scaleCaptionsForSpeed(captions, speed);
   const assPath = path.join(workDir, "story.ass");
   await fs.writeFile(
@@ -507,8 +599,9 @@ async function renderWithFfmpeg(
   );
 
   const src = poolMeta[Math.floor(Math.random() * poolMeta.length)]!;
+  const outEst = voiceSec / speed;
   onLog(
-    `B-roll: ${poolLabel} — ${speed}× whole Short ← ${src.label} (VO ${voiceSec.toFixed(1)}s → ~${(voiceSec / speed).toFixed(1)}s)`
+    `B-roll: ${poolLabel} — ${speed.toFixed(2)}× whole Short ← ${src.label} (VO ${voiceSec.toFixed(1)}s → ~${outEst.toFixed(1)}s, Shorts≤${MAX_SHORTS_DURATION_SEC}s)`
   );
 
   return encodeStoryOnePass({

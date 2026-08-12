@@ -1,15 +1,18 @@
 /**
- * Production Groq story planner for faceless YouTube storytelling.
+ * Production story planner for faceless YouTube storytelling.
  *
- * Reddit dump → first-person viral horror narration (JSON) → Kokoro / Edge TTS → FFmpeg.
+ * Reddit dump → first-person spoken retell (JSON) → Kokoro / Edge TTS → FFmpeg.
  *
- * Public API: `planStoryWithGroq(story, lang?)`
+ * Public API: `planStoryWithGroq(story, lang?)` (name kept for callers)
+ * Provider order: Gemini (primary) → Groq (fallback).
  *
- * Prompt v2: storyteller-from-memory voice (not summary/screenplay). Schema + normalize/retry/tpm unchanged.
+ * Prompt v3: preserve every important event (no summary); length follows the source.
  */
 
+import { GoogleGenAI } from "@google/genai";
 import Groq from "groq-sdk";
 import {
+  getGeminiApiKey,
   getGroqApiKey,
   type CameraMovement,
   type CaptionStyle,
@@ -25,9 +28,11 @@ export type { StoryLang } from "@/lib/storyTypes";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = "llama-3.3-70b-versatile";
-const DEFAULT_TPM_BUDGET = 12_000;
-const DEFAULT_MAX_COMPLETION = 3_500;
+const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+const DEFAULT_TPM_BUDGET = 30_000;
+/** Long Reddit dumps need a large completion window so the model doesn't summarize. */
+const DEFAULT_MAX_COMPLETION = 5_000;
 /** Rough duration estimates in normalize only — not a pacing script for the model. */
 const WORDS_PER_SEC = 2.4;
 
@@ -125,9 +130,9 @@ function fitToTpmBudget(
     return { storyForPrompt: story, maxTokens, truncated: false };
   }
 
-  // CHANGE: truncation hint asks for spoken memory + unanswered ending (not "twist summary")
+  // Prefer keeping as much raw story as possible for complete retells.
   return {
-    storyForPrompt: `${story.slice(0, maxChars)}\n\n[INPUT TRUNCATED for API token limits — turn retained beats into a complete first-person spoken recollection that escalates danger and ends on one unanswered question.]`,
+    storyForPrompt: `${story.slice(0, maxChars)}\n\n[INPUT TRUNCATED for API token limits — RETELL every important event present in the retained text. Do NOT invent the missing ending. Do NOT summarize. Spoken length should match what remains.]`,
     maxTokens,
     truncated: true,
   };
@@ -136,7 +141,6 @@ function fitToTpmBudget(
 // ─── Prompt construction ─────────────────────────────────────────────────────
 
 function languageDirective(lang: StoryLang): string {
-  // CHANGE: compressed language rules (~same EN/HI field split, fewer lines)
   if (lang === "hi") {
     return `LANGUAGE: Spoken fields (title, hook, fullNarration, timedTranscript, endingQuestion, scene.narration) = natural Hindi Devanagari — Shorts speech, not stiff or Latin Hinglish. Visual fields (pexelsQuery, imagePrompt, thumbnailPrompt, hashtags, soundEffect) + enums = English.`;
   }
@@ -144,47 +148,65 @@ function languageDirective(lang: StoryLang): string {
 }
 
 /**
- * CHANGE: full system-prompt rewrite — first-person storyteller voice; dropped fixed
- * second-by-second retention curve / trailer / Remotion caption essay; ~30% shorter.
- * JSON field names kept for normalizeStoryPlan / StoryPlan compatibility.
+ * Viral storyteller prompt v3 — RETELL the same story spoken from memory.
+ * Preserve every important event; do not summarize or invent.
  */
 function buildSystemPrompt(lang: StoryLang): string {
-  return `You are a horror storyteller speaking from memory — cadence like MrBallen, Mr. Nightmare, Let's Read, Dark Somnium (influence only; never copy wording or branded phrases).
+  return `You are an expert viral storyteller for YouTube Shorts.
 
-Turn raw Reddit / nosleep dumps into first-person SPOKEN Shorts narration. The listener discovers everything WITH you — never hear a summary of what happened.
+Your job is NOT to rewrite or summarize the story.
+Your job is to RETELL the exact same story as if the original person is speaking directly to the audience from memory.
+The listener should experience every important moment exactly as it happened.
 
 ${languageDirective(lang)}
 
-VOICE
-• Always first person ("I…" / "मैं…"). Inside the terror. Never outside narrator.
-• Sound remembered aloud: short sentences, natural pauses, occasional "..."
-• Reveal only what you notice in the moment.
-• Every 1–3 sentences MUST add mystery, danger, contradiction, reveal, or a question. No filler.
-• Soft length ~250–350 spoken words (complete escalation > dumping every Reddit detail).
+PRIMARY RULE
+• Preserve EVERY important event.
+• Do not remove plot points.
+• Do not merge important events together.
+• Do not skip confrontations, twists, dialogue, emotional moments, decisions, consequences, callbacks, or ending payoffs.
+• Do not invent new events.
+• Do not change the order.
+• Output = SAME STORY with smoother spoken wording.
+• If the input would take ~5 minutes to tell, fullNarration should also be ~5 minutes of speech.
+• Only remove repetitive descriptions that do not affect the story.
+• Never shorten major events.
+• Target 95–100% story coverage — feel like the original person telling it, not a Reddit summary.
 
-FORBIDDEN
-"This is the story of" · "I never imagined" · "Little did I know" · "Things were about to get worse" · "The real horror had only begun" · "So this happened" · "I've always believed" · greetings · Wikipedia tone · movie-trailer voice · summarizing the post.
+NARRATION STYLE
+• FIRST PERSON only.
+• Natural spoken English (or Hindi per LANGUAGE). Contractions. Short sentences. Natural pauses.
+• Never sound like a novel, Wikipedia, an AI, or a movie trailer.
+• Never summarize what happened — the audience discovers the story as it unfolds.
 
-HOOK — first sentence of fullNarration
-Instant curiosity. Wrong or impossible fact. No setup.
-Good: "I answered my dead father's phone." / "I woke up covered in mud." / "मैं रोज पड़ोसी के कमरे से चीखें सुनता था।"
-Bad: time/place warmups, "I've always…", "So this begins…"
+MANDATORY BEATS (when present in the input)
+confrontation · dialogue · betrayal · reveal · emotional reaction · plot twist · consequence · decision · callback · ending payoff
+Each MUST appear. Example: Mother refuses food → Trevor gets seconds → silence → they leave → father texts about rent = ALL FIVE beats, never collapsed into one summary line.
 
-PACE
-Escalate danger every few lines. Each reveal opens a new question. Never let curiosity drop. No fixed second counts.
+HOOK
+• If the original already starts with a strong hook, KEEP IT (grammar polish only).
+• Do not invent clickbait.
 
-DIALOGUE
-Rare. One short line when it hurts. Beat: He looked at me. "Don't open that door." Then he was gone.
+PACING
+• Tell naturally. Do not rush. Do not compress multiple scenes into one.
+• One meaningful event = one scene / narration chunk.
+• If there are ~25 important moments, use ~25 chunks (use as many scenes as needed; typically 8–40).
+
+EMOTION
+• Do not exaggerate. Show, don't tell.
+• FORBIDDEN filler: "I never expected…" · "Things were about to get worse" · "The real horror had only begun" · "You won't believe…" · "This changed my life forever" · "This is the story of" · "Little did I know" · "So this happened" · greetings · trailer voice · summarizing the post.
 
 ENDING
-Never fully explain. Leave one major unanswered question (Part 2 itch). endingQuestion states that itch.
+• Preserve the original ending. Do not replace it. Do not invent a cliffhanger.
+• If it ends answered, keep it answered. If it ends with an unanswered question, keep that question.
+• endingQuestion should reflect the real ending itch (or restated final beat) — not a fake Part-2 bait.
 
 SCENES
-6–14 logical spoken chunks that concatenate into fullNarration (no repeats, no mini-summaries).
-Each: one narration chunk + emotion + rough durationSec + pexelsQuery (3–6 concrete English words) + imagePrompt (cinematic still, no text/celebrities) + optional captionHighlightWords (1–3) + camera/captionStyle/transition/soundEffect.
-durationSec / startSec are rough only — code will retime.
+• Chunks concatenate in order into fullNarration (no repeats, no mini-summaries).
+• Each scene: one narration chunk + emotion + rough durationSec + pexelsQuery (3–6 concrete English words) + imagePrompt (cinematic still, no text/celebrities) + optional captionHighlightWords (1–3) + camera/captionStyle/transition/soundEffect.
+• durationSec / startSec are rough only — code will retime.
 
-JSON ONLY (no markdown):
+JSON ONLY (no markdown). Escape every " inside strings as \\". Example dialogue: "She said \\"Leave.\\""
 {
   "title": string,
   "hook": string,
@@ -211,15 +233,16 @@ JSON ONLY (no markdown):
 }
 
 timedTranscript = fullNarration with (M:SS) before each scene phrase, same order as scenes.
-hashtags: 5–10 lowercase, no #. hook = first spoken sentence.`;
+hashtags: 5–10 lowercase, no #. hook = first spoken sentence of fullNarration.`;
 }
 
 function buildUserPrompt(lang: StoryLang, storyBody: string): string {
-  // CHANGE: user brief matches storyteller rules (no fixed retention-curve jargon)
   const langLabel = lang === "hi" ? "Hindi Devanagari" : "English";
-  return `Rewrite this raw dump as a ${langLabel} first-person spoken horror recollection (JSON only).
+  return `RETELL this raw dump as a ${langLabel} first-person spoken recollection (JSON only).
 
-Hook in sentence one. Never summarize. Escalate mystery/danger. End unexplained with one burning question. Short spoken lines.
+Do NOT summarize. Do NOT invent events. Do NOT skip confrontations, dialogue, twists, or the original ending.
+Preserve every important beat in order. Spoken length should match the source story (longer input → longer fullNarration).
+Use as many scene chunks as needed (one meaningful event per chunk).
 
 RAW STORY:
 ---
@@ -297,6 +320,43 @@ async function callGroqOnce(args: {
   return text;
 }
 
+async function callGeminiOnce(args: {
+  apiKey: string;
+  model: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+  temperature?: number;
+}): Promise<string> {
+  const ai = new GoogleGenAI({ apiKey: args.apiKey });
+  const response = await ai.models.generateContent({
+    model: args.model,
+    contents: args.user,
+    config: {
+      systemInstruction: args.system,
+      temperature: args.temperature ?? 0.55,
+      maxOutputTokens: args.maxTokens,
+      responseMimeType: "application/json",
+    },
+  });
+  const finishReason = response.candidates?.[0]?.finishReason;
+  if (finishReason) {
+    console.log(`[story-planner] Gemini finishReason=${finishReason}`);
+  }
+  if (String(finishReason || "").toUpperCase().includes("MAX")) {
+    console.warn(
+      "[story-planner] Gemini hit max output tokens — JSON may be truncated. Raise GEMINI_MAX_TOKENS."
+    );
+  }
+  const text = response.text?.trim() ?? "";
+  if (!text) {
+    throw new Error(
+      `Empty Gemini completion (model=${args.model}, finish=${finishReason ?? "n/a"}). Check GEMINI_API_KEY / quota.`
+    );
+  }
+  return text;
+}
+
 // ─── JSON extract + light repair ─────────────────────────────────────────────
 
 function stripCodeFences(text: string): string {
@@ -306,20 +366,69 @@ function stripCodeFences(text: string): string {
     .trim();
 }
 
-/** Best-effort: close dangling braces/brackets and remove trailing commas. */
+/**
+ * Escape bare " that appear inside JSON string values (common with dialogue).
+ * A quote is treated as structural only when followed (after optional space) by
+ * , } ] : or end — otherwise it becomes \".
+ */
+function escapeInteriorQuotes(jsonish: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < jsonish.length; i++) {
+    const ch = jsonish[i]!;
+    if (!inStr) {
+      out += ch;
+      if (ch === '"') inStr = true;
+      continue;
+    }
+    if (esc) {
+      out += ch;
+      esc = false;
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch;
+      esc = true;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < jsonish.length && /\s/.test(jsonish[j]!)) j++;
+      const next = jsonish[j] ?? "";
+      const structural = next === "" || /[,}\]:]/.test(next);
+      if (structural) {
+        out += '"';
+        inStr = false;
+      } else {
+        out += '\\"';
+      }
+      continue;
+    }
+    // newlines inside strings break JSON — keep as space
+    if (ch === "\n" || ch === "\r") {
+      out += " ";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** If truncated mid-string / mid-object, close the open string then balance braces. */
 function softRepairJson(text: string): string {
   let s = stripCodeFences(text);
   const start = s.indexOf("{");
   if (start < 0) throw new Error("No JSON object found in model output.");
   s = s.slice(start);
+  s = escapeInteriorQuotes(s);
 
-  // Trim past last plausible closing brace
-  const lastBrace = s.lastIndexOf("}");
-  if (lastBrace > 0) s = s.slice(0, lastBrace + 1);
+  // Drop trailing incomplete key fragments after last complete value when truncated
+  s = s.replace(/,\s*"[^"]*$/, "");
+  s = s.replace(/,\s*$/, "");
 
   s = s.replace(/,\s*([}\]])/g, "$1");
 
-  // Balance braces / brackets
   const stack: string[] = [];
   let inStr = false;
   let esc = false;
@@ -334,6 +443,7 @@ function softRepairJson(text: string): string {
     else if (ch === "{" || ch === "[") stack.push(ch);
     else if (ch === "}" || ch === "]") stack.pop();
   }
+  if (inStr) s += '"';
   while (stack.length) {
     const open = stack.pop();
     s += open === "{" ? "}" : "]";
@@ -346,10 +456,23 @@ function parseJsonObject(text: string): unknown {
   const cleaned = stripCodeFences(text);
   try {
     return JSON.parse(cleaned);
-  } catch {
-    const repaired = softRepairJson(text);
-    return JSON.parse(repaired);
+  } catch (first) {
+    try {
+      const repaired = softRepairJson(text);
+      return JSON.parse(repaired);
+    } catch {
+      throw first instanceof Error ? first : new Error(String(first));
+    }
   }
+}
+
+function logGeminiRaw(rawText: string): void {
+  console.log("========== GEMINI ==========");
+  console.log(rawText);
+  console.log("============================");
+  console.log(
+    `[story-planner] Gemini raw length=${rawText.length} chars`
+  );
 }
 
 // ─── Normalization / validation ──────────────────────────────────────────────
@@ -531,10 +654,9 @@ export function normalizeStoryPlan(raw: unknown): StoryPlan {
     thumbnailPrompt:
       String(o.thumbnailPrompt ?? "").trim() ||
       `Cinematic horror thumbnail: ${scenes[0]?.pexelsQuery ?? "dark hallway"}, high contrast, no text`,
-    // CHANGE: Part-2 itch default (not generic "what would you have done")
     endingQuestion:
       String(o.endingQuestion ?? "").trim() ||
-      "And if it happens again tonight… who opens the door first?",
+      "What would you have done next?",
     hashtags: normalizeHashtags(o.hashtags),
     scenes,
   };
@@ -554,9 +676,151 @@ function assertPlanQuality(plan: StoryPlan): void {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
+function finalizePlan(plan: StoryPlan, sourceStory: string): StoryPlan {
+  const coverage =
+    plan.fullNarration.replace(/\s+/g, " ").trim().length /
+    Math.max(1, sourceStory.replace(/\s+/g, " ").trim().length);
+  if (coverage < 0.45) {
+    console.warn(
+      `[story-planner] Narration looks short vs input (coverage≈${(coverage * 100).toFixed(0)}%). Check fullNarration for missing beats.`
+    );
+  }
+  return plan;
+}
+
+async function planWithGemini(
+  trimmed: string,
+  lang: StoryLang,
+  system: string,
+  user: string,
+  maxTokens: number
+): Promise<StoryPlan> {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY not set");
+  }
+  const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+  let lastError: Error | null = null;
+  let lastRaw = "";
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const temperature = attempt === 1 ? 0.45 : 0.15;
+      const completionUser =
+        attempt === 1
+          ? `${user}
+
+JSON RULES (critical):
+- Return ONLY a single JSON object (responseMimeType=application/json).
+- Escape every double-quote inside string values as \\".
+- Dialogue must use escaped quotes, e.g. "She said \\"Leave.\\""
+- No markdown fences. No commentary outside JSON.`
+          : `${user}
+
+Your previous response was invalid JSON.
+
+${lastRaw ? `Broken fragment (for reference, do not copy):\n${lastRaw.slice(0, 500)}\n` : ""}
+Return ONLY valid JSON.
+Do NOT include markdown.
+Do NOT include explanations.
+Escape all quotation marks inside strings as \\".
+The JSON must be directly parsable by JSON.parse().
+RETELL every important event — do not summarize or invent.`;
+
+      console.log(
+        `[story-planner] Gemini attempt ${attempt} (model=${model}, maxOutputTokens=${maxTokens})…`
+      );
+      const rawText = await callGeminiOnce({
+        apiKey,
+        model,
+        system,
+        user: completionUser,
+        maxTokens,
+        temperature,
+      });
+      lastRaw = rawText;
+      logGeminiRaw(rawText);
+
+      const plan = normalizeStoryPlan(parseJsonObject(rawText));
+      assertPlanQuality(plan);
+      return finalizePlan(plan, trimmed);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(
+        `[story-planner] Gemini attempt ${attempt} failed:`,
+        lastError.message
+      );
+    }
+  }
+
+  throw new Error(
+    `Gemini planner failed: ${lastError?.message ?? "unknown error"}`
+  );
+}
+
+async function planWithGroq(
+  trimmed: string,
+  lang: StoryLang,
+  system: string
+): Promise<StoryPlan> {
+  const client = new Groq({ apiKey: getGroqApiKey() });
+  const model = process.env.GROQ_MODEL?.trim() || DEFAULT_GROQ_MODEL;
+  const userPrefix = buildUserPrompt(lang, "");
+  const { storyForPrompt, maxTokens, truncated } = fitToTpmBudget(
+    system,
+    userPrefix,
+    trimmed
+  );
+  const user = buildUserPrompt(lang, storyForPrompt);
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const temperature = attempt === 1 ? 0.55 : 0.25;
+      const completionUser =
+        attempt === 1
+          ? user
+          : `${user}\n\nPREVIOUS OUTPUT WAS INVALID JSON OR FAILED VALIDATION.
+Return ONLY a complete valid JSON object matching the schema. No markdown. No commentary.
+RETELL every important event from the raw story — do not summarize or invent. First-person spoken voice only.`;
+
+      console.log(`[story-planner] Groq attempt ${attempt} (model=${model})…`);
+      const rawText = await callGroqOnce({
+        client,
+        model,
+        system,
+        user: completionUser,
+        maxTokens,
+        temperature,
+      });
+
+      const plan = normalizeStoryPlan(parseJsonObject(rawText));
+      assertPlanQuality(plan);
+
+      if (truncated) {
+        console.warn(
+          "[story-planner] Input story truncated to fit Groq TPM budget; plan covers retained text only."
+        );
+      }
+
+      return finalizePlan(plan, trimmed);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(
+        `[story-planner] Groq attempt ${attempt} failed:`,
+        lastError.message
+      );
+    }
+  }
+
+  throw new Error(
+    `Groq planner failed after retry: ${lastError?.message ?? "unknown error"}`
+  );
+}
+
 /**
- * Plan a first-person spoken horror story from a raw Reddit-style dump.
- * Retries once if JSON is unusable; auto-repairs timings and missing fields.
+ * Plan a first-person spoken retell from a raw Reddit-style dump.
+ * Tries Gemini first (when GEMINI_API_KEY is set), then falls back to Groq.
  */
 export async function planStoryWithGroq(
   story: string,
@@ -567,57 +831,36 @@ export async function planStoryWithGroq(
     throw new Error("Story is too short to plan (need ~20+ characters).");
   }
 
-  const client = new Groq({ apiKey: getGroqApiKey() });
-  const model = process.env.GROQ_MODEL?.trim() || DEFAULT_MODEL;
   const system = buildSystemPrompt(lang);
-  const userPrefix = buildUserPrompt(lang, ""); // length probe without body
-  const { storyForPrompt, maxTokens, truncated } = fitToTpmBudget(
-    system,
-    userPrefix,
-    trimmed
+  const geminiKey = getGeminiApiKey();
+  // Gemini gets a larger dedicated budget; Groq still uses TPM-fitted max.
+  const geminiMaxTokens = Math.max(
+    4_096,
+    Number(process.env.GEMINI_MAX_TOKENS) || 8_192
   );
-  const user = buildUserPrompt(lang, storyForPrompt);
 
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  if (geminiKey) {
     try {
-      // CHANGE: warmer first pass for spoken voice; cooler retry for valid JSON
-      const temperature = attempt === 1 ? 0.78 : 0.35;
-      const completionUser =
-        attempt === 1
-          ? user
-          : `${user}\n\nPREVIOUS OUTPUT WAS INVALID JSON OR FAILED VALIDATION.
-Return ONLY a complete valid JSON object matching the schema. No markdown. No commentary. First-person spoken voice only.`;
-
-      const rawText = await callGroqOnce({
-        client,
-        model,
+      // Gemini has a large context window — send the full story (no Groq TPM trim).
+      const user = buildUserPrompt(lang, trimmed);
+      const plan = await planWithGemini(
+        trimmed,
+        lang,
         system,
-        user: completionUser,
-        maxTokens,
-        temperature,
-      });
-
-      const parsed = parseJsonObject(rawText);
-      const plan = normalizeStoryPlan(parsed);
-      assertPlanQuality(plan);
-
-      if (truncated) {
-        // Non-fatal: input was sliced for Groq TPM; plan still valid
-        console.warn(
-          "[story-planner] Input story truncated to fit Groq TPM budget; plan covers retained beats."
-        );
-      }
-
+        user,
+        geminiMaxTokens
+      );
+      console.log("[story-planner] Using Gemini plan");
       return plan;
     } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      console.warn(`[story-planner] attempt ${attempt} failed:`, lastError.message);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[story-planner] Gemini failed → falling back to Groq: ${msg}`);
     }
+  } else {
+    console.warn(
+      "[story-planner] GEMINI_API_KEY missing — using Groq only"
+    );
   }
 
-  throw new Error(
-    `Story planner failed after retry: ${lastError?.message ?? "unknown error"}`
-  );
+  return planWithGroq(trimmed, lang, system);
 }

@@ -107,3 +107,9 @@ export function getGroqApiKey(): string {
   if (!k) throw new Error("Missing GROQ_API_KEY in .env");
   return k;
 }
+
+/** Optional — story planner prefers Gemini when set. */
+export function getGeminiApiKey(): string | null {
+  const k = process.env.GEMINI_API_KEY?.trim() || "";
+  return k || null;
+}

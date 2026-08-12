@@ -45,13 +45,25 @@ async function getKokoroTts(): Promise<KokoroInstance> {
   return ttsPromise;
 }
 
-function resolveEnVoice(): string {
+function resolveEnVoice(override?: string | null): string {
+  if (override?.trim()) return override.trim();
   return process.env.KOKORO_VOICE?.trim() || "af_heart";
 }
 
 /** Edge neural voice for Hindi (kokoro-js npm has no hf_/hm_ voices yet). */
-function resolveHiEdgeVoice(): string {
+function resolveHiEdgeVoice(override?: string | null): string {
+  if (override?.trim()) return override.trim();
   return process.env.HINDI_EDGE_VOICE?.trim() || "hi-IN-MadhurNeural";
+}
+
+export type VoiceGender = "female" | "male";
+
+/** Map UI gender → Kokoro (EN) / Edge (HI) voice id. */
+export function voiceIdForGender(lang: StoryLang, gender: VoiceGender): string {
+  if (lang === "hi") {
+    return gender === "male" ? "hi-IN-MadhurNeural" : "hi-IN-SwaraNeural";
+  }
+  return gender === "male" ? "am_fenrir" : "af_heart";
 }
 
 function resolveSpeed(): number {
@@ -158,9 +170,10 @@ function splitForTts(text: string, maxChars = 280): string[] {
 async function synthesizeKokoroEn(
   text: string,
   outPath: string,
-  onLog?: (msg: string) => void
+  onLog?: (msg: string) => void,
+  voiceOverride?: string | null
 ): Promise<VoiceResult> {
-  const voice = resolveEnVoice();
+  const voice = resolveEnVoice(voiceOverride);
   const speed = resolveSpeed();
   onLog?.(
     `Kokoro EN (${MODEL_ID}, voice=${voice}, speed=${speed}) — one continuous WAV…`
@@ -227,9 +240,10 @@ async function synthesizeKokoroEn(
 async function synthesizeEdgeHi(
   text: string,
   outPathWav: string,
-  onLog?: (msg: string) => void
+  onLog?: (msg: string) => void,
+  voiceOverride?: string | null
 ): Promise<VoiceResult> {
-  const voice = resolveHiEdgeVoice();
+  const voice = resolveHiEdgeVoice(voiceOverride);
   onLog?.(
     `Hindi Edge (${voice}, speed=${resolveSpeed()}) — one continuous WAV…`
   );
@@ -312,7 +326,8 @@ export async function synthesizeStoryVoice(
   text: string,
   outPathNoExt: string,
   lang: StoryLang = "en",
-  onLog?: (msg: string) => void
+  onLog?: (msg: string) => void,
+  opts?: { voice?: string | null; gender?: VoiceGender | null }
 ): Promise<VoiceResult> {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) throw new Error("Cannot synthesize empty narration.");
@@ -320,10 +335,14 @@ export async function synthesizeStoryVoice(
   const outPath = outPathNoExt.endsWith(".wav") ? outPathNoExt : `${outPathNoExt}.wav`;
   await fs.mkdir(path.dirname(outPath), { recursive: true });
 
+  const voice =
+    opts?.voice?.trim() ||
+    (opts?.gender ? voiceIdForGender(lang, opts.gender) : null);
+
   if (lang === "hi") {
-    return synthesizeEdgeHi(cleaned, outPath, onLog);
+    return synthesizeEdgeHi(cleaned, outPath, onLog, voice);
   }
-  return synthesizeKokoroEn(cleaned, outPath, onLog);
+  return synthesizeKokoroEn(cleaned, outPath, onLog, voice);
 }
 
 /** @deprecated use synthesizeStoryVoice */
