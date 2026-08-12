@@ -15,10 +15,10 @@ type StoryPlanLite = {
 };
 
 const SPEED_PRESETS = [
-  { id: "1.25", label: "1.25×", hint: "Slightly snappy" },
-  { id: "1.35", label: "1.35×", hint: "Default" },
-  { id: "1.5", label: "1.5×", hint: "Fast Shorts pace" },
-  { id: "auto", label: "Auto ≤2:59", hint: "Fits YouTube Shorts" },
+  { id: "1.35", label: "1.35×", hint: "Slightly snappy" },
+  { id: "1.5", label: "1.5×", hint: "Default pace" },
+  { id: "1.75", label: "1.75×", hint: "Very fast" },
+  { id: "auto", label: "Auto ≤0:59", hint: "Always under 1 min" },
 ] as const;
 
 function formatDuration(sec: number | null | undefined): string {
@@ -315,7 +315,7 @@ export default function Home() {
                 ))}
               </div>
               <p className="text-xs text-zinc-500">
-                Auto raises speed if needed so the Short stays under 2:59 for YouTube.
+                Auto raises speed if needed so every Short stays under 1:00.
               </p>
             </fieldset>
 

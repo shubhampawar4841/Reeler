@@ -10,6 +10,7 @@ import { buildAssFromVoiceCaptions } from "@/lib/dummyCaptions";
 import { planStoryWithGroq, type StoryLang } from "@/lib/groqStoryboard";
 import {
   synthesizeStoryVoice,
+  warmKokoroTts,
   type VoiceGender,
 } from "@/lib/kokoroTts";
 import { alignVoiceCaptions } from "@/lib/alignVoiceCaptions";
@@ -36,15 +37,17 @@ export const STORY_HEIGHT = 1920;
 /**
  * Single final encode only (no intermediate H.264 passes).
  * Target ~20–25MB / 60s @ 1080x1920 / 30fps (≈2.7–3.3 Mbps).
+ * Override with STORY_ENCODE_PRESET / STORY_ENCODE_CRF (Hobby: prefer veryfast).
  */
-const ENCODE_PRESET = "slow";
-const ENCODE_CRF = "29";
+const ENCODE_PRESET =
+  process.env.STORY_ENCODE_PRESET?.trim() || "ultrafast";
+const ENCODE_CRF = process.env.STORY_ENCODE_CRF?.trim() || "29";
 const ENCODE_MAXRATE = "3.5M";
 const ENCODE_BUFSIZE = "7M";
 const ENCODE_AUDIO_BITRATE = "64k";
 
-/** YouTube Shorts: over 3:00 is treated as a regular video — stay under. */
-export const MAX_SHORTS_DURATION_SEC = 179;
+/** Hard ceiling for finished story Shorts — always under 1 minute. */
+export const MAX_SHORTS_DURATION_SEC = 59;
 
 /**
  * Preferred whole-Short speed (B-roll + VO + captions).
@@ -55,22 +58,23 @@ function resolveBasePlaybackSpeed(preferred?: number | null): number {
     return preferred;
   }
   const raw = Number(process.env.STORY_SPEED ?? process.env.BROLL_SPEED);
-  if (Number.isFinite(raw) && raw >= 1 && raw <= 2) return raw;
-  return 1.35;
+  if (Number.isFinite(raw) && raw >= 1 && raw <= 2.5) return raw;
+  return 1.5;
 }
 
 /**
  * Speed so final duration ≤ MAX_SHORTS_DURATION_SEC while keeping full narration.
- * When autoFit is true (default), raises speed to fit ≤179s. Max 3.5×.
+ * When autoFit is true (default), raises speed to fit ≤59s. Max 3.5×.
  */
 function resolveShortsPlaybackSpeed(
   voiceSec: number,
   onLog?: StoryVideoLog,
   opts?: { preferredSpeed?: number | null; autoFit?: boolean }
 ): number {
+  const envCap = Number(process.env.MAX_SHORTS_SEC);
   const maxSec = Math.min(
-    179,
-    Math.max(60, Number(process.env.MAX_SHORTS_SEC) || MAX_SHORTS_DURATION_SEC)
+    59,
+    Math.max(30, Number.isFinite(envCap) && envCap > 0 ? envCap : MAX_SHORTS_DURATION_SEC)
   );
   const autoFit = opts?.autoFit !== false;
   const base = resolveBasePlaybackSpeed(opts?.preferredSpeed);
@@ -93,10 +97,44 @@ function resolveShortsPlaybackSpeed(
   );
   if (outSec > maxSec + 0.25) {
     onLog?.(
-      `Warning: even @ ${speed.toFixed(2)}× output ~${outSec.toFixed(1)}s may exceed Shorts limit`
+      `Warning: even @ ${speed.toFixed(2)}× output ~${outSec.toFixed(1)}s may exceed ${maxSec}s cap`
     );
   }
   return speed;
+}
+
+/** Soft char budget so TTS+Whisper+encode stay under ~2 min wall clock and VO fits ≤59s. */
+function narrationCharBudget(): number {
+  const raw = Number(process.env.STORY_NARRATION_MAX_CHARS);
+  if (Number.isFinite(raw) && raw >= 400 && raw <= 4000) return Math.floor(raw);
+  return 1100;
+}
+
+/** Trim plan narration at a sentence boundary if the model overshot the Shorts budget. */
+function clampNarrationForShort(
+  text: string,
+  onLog?: StoryVideoLog
+): string {
+  const maxChars = narrationCharBudget();
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+
+  let cut = cleaned.slice(0, maxChars);
+  const lastStop = Math.max(
+    cut.lastIndexOf(". "),
+    cut.lastIndexOf("! "),
+    cut.lastIndexOf("? "),
+    cut.lastIndexOf("। ")
+  );
+  if (lastStop >= Math.floor(maxChars * 0.55)) {
+    cut = cut.slice(0, lastStop + 1).trim();
+  } else {
+    cut = cut.replace(/\s+\S*$/, "").trim();
+  }
+  onLog?.(
+    `Narration clamped ${cleaned.length} → ${cut.length} chars (budget ${maxChars}) for ≤59s Short`
+  );
+  return cut || cleaned.slice(0, maxChars);
 }
 
 /** atempo only accepts 0.5–2.0 per filter; chain for safety. */
@@ -144,9 +182,9 @@ export type BuildStoryVideoOptions = {
   brollId?: string | null;
   /** male | female — maps to Kokoro / Edge voice */
   voiceGender?: VoiceGender | null;
-  /** Preferred playback speed (1–2.5). Auto-raised to fit Shorts ≤3:00 unless autoFitSpeed=false. */
+  /** Preferred playback speed (1–2.5). Auto-raised to fit ≤59s unless autoFitSpeed=false. */
   storySpeed?: number | null;
-  /** When true (default), bump speed so output ≤ 2:59. */
+  /** When true (default), bump speed so output ≤ 0:59. */
   autoFitSpeed?: boolean;
   onLog?: StoryVideoLog;
 };
@@ -365,6 +403,7 @@ async function encodeStoryOnePass(args: {
   voicePath: string;
   assPath: string;
   outPath: string;
+  workDir: string;
   voiceSec: number;
   playbackSpeed: number;
   onLog: StoryVideoLog;
@@ -375,15 +414,15 @@ async function encodeStoryOnePass(args: {
     voicePath,
     assPath,
     outPath,
+    workDir,
     voiceSec,
     playbackSpeed: speed,
     onLog,
   } = args;
 
   const voiceIn = Math.max(0.2, voiceSec);
-  // Hard Shorts ceiling — never emit ≥ 3:00 even with rounding drift.
+  // Hard ceiling — finished Short always under 1:00.
   const outDur = Math.min(voiceIn / speed, MAX_SHORTS_DURATION_SEC);
-  // Consume speed× source so after setpts it matches outDur.
   const sourceNeed = voiceIn;
   const canTrim = brollDurSec >= sourceNeed + 0.05;
   const startSec = canTrim ? Math.random() * (brollDurSec - sourceNeed) : 0;
@@ -398,14 +437,77 @@ async function encodeStoryOnePass(args: {
     );
   }
 
-  const srcProbe = await probeMedia(brollPath);
+  // Remotes: stage only the needed window locally so the heavy filter pass isn't network-bound.
+  let videoInput = brollPath;
+  let useLoop = !canTrim;
+  let trimStart = startSec;
+  const isRemote = /^https?:\/\//i.test(brollPath);
+  if (isRemote && canTrim) {
+    const staged = path.join(workDir, "broll-stage.mp4");
+    onLog(
+      `Staging remote B-roll trim locally (${sourceNeed.toFixed(1)}s) for faster encode…`
+    );
+    try {
+      await runFfmpeg(
+        [
+          "-y",
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-ss",
+          startSec.toFixed(3),
+          "-t",
+          (sourceNeed + 0.35).toFixed(3),
+          "-i",
+          brollPath,
+          "-an",
+          "-c:v",
+          "copy",
+          staged,
+        ],
+        onLog
+      );
+      videoInput = staged;
+      trimStart = 0;
+      onLog("Remote B-roll staged (stream copy)");
+    } catch (e) {
+      onLog(
+        `Stream-copy stage failed (${e instanceof Error ? e.message : String(e)}); trying ultrafast re-encode stage…`
+      );
+      await runFfmpeg(
+        [
+          "-y",
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-ss",
+          startSec.toFixed(3),
+          "-t",
+          (sourceNeed + 0.35).toFixed(3),
+          "-i",
+          brollPath,
+          "-an",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "ultrafast",
+          "-crf",
+          "28",
+          "-pix_fmt",
+          "yuv420p",
+          staged,
+        ],
+        onLog
+      );
+      videoInput = staged;
+      trimStart = 0;
+      onLog("Remote B-roll staged (ultrafast re-encode)");
+    }
+  }
+
   onLog(
-    `Encode BEFORE (source B-roll): ` +
-      (srcProbe.sizeBytes > 0 ? `size=${formatMb(srcProbe.sizeBytes)}, ` : "") +
-      `dur=${srcProbe.durationSec.toFixed(1)}s` +
-      (srcProbe.bitrateKbps != null
-        ? `, avgBitrate=${srcProbe.bitrateKbps.toFixed(0)} kbps`
-        : "")
+    `Encode BEFORE (source B-roll): dur=${brollDurSec.toFixed(1)}s (probed earlier)` +
+      (isRemote ? ", remote→local staged" : "")
   );
   onLog(
     `Encode settings: preset=${ENCODE_PRESET} crf=${ENCODE_CRF} maxrate=${ENCODE_MAXRATE} ` +
@@ -418,17 +520,17 @@ async function encodeStoryOnePass(args: {
   ].join(";");
 
   const ffArgs: string[] = ["-y", "-hide_banner"];
-  if (canTrim) {
+  if (useLoop) {
+    ffArgs.push("-stream_loop", "-1", "-i", videoInput);
+  } else {
     ffArgs.push(
       "-ss",
-      startSec.toFixed(3),
+      trimStart.toFixed(3),
       "-t",
       sourceNeed.toFixed(3),
       "-i",
-      brollPath
+      videoInput
     );
-  } else {
-    ffArgs.push("-stream_loop", "-1", "-i", brollPath);
   }
   ffArgs.push(
     "-i",
@@ -500,9 +602,11 @@ async function prepareStoryAssets(
   const { story, lang = "en", onLog = console.log, voiceGender } = options;
   const jobId = uuidv4();
   const workDir = path.join(os.tmpdir(), "reeler-story", jobId);
-  await fs.mkdir(workDir, { recursive: true });
   const outDir = path.join(process.cwd(), "public", "output", jobId);
-  await fs.mkdir(outDir, { recursive: true });
+  await Promise.all([
+    fs.mkdir(workDir, { recursive: true }),
+    fs.mkdir(outDir, { recursive: true }),
+  ]);
   const outPath = path.join(outDir, "story.mp4");
 
   const storySpeed =
@@ -511,14 +615,32 @@ async function prepareStoryAssets(
       : null;
   const autoFitSpeed = options.autoFitSpeed !== false;
 
-  const { poolMeta, usedUpload, poolLabel } = await resolveBrollPool(
-    options,
-    onLog
+  onLog(
+    `Planning + B-roll in parallel (${lang === "hi" ? "Hindi" : "English"})…`
   );
+  const warmTts =
+    lang === "en"
+      ? warmKokoroTts().then(() => {
+          onLog("Kokoro model warm (overlapped with plan/B-roll)");
+        })
+      : Promise.resolve();
 
-  onLog(`Planning storyboard with Gemini→Groq (${lang === "hi" ? "Hindi" : "English"})…`);
-  const plan = await planStoryWithGroq(story, lang);
-  onLog(`Plan ready: "${plan.title}" · ${plan.scenes.length} scene(s)`);
+  const [broll, plan] = await Promise.all([
+    resolveBrollPool(options, onLog),
+    planStoryWithGroq(story, lang),
+    warmTts,
+  ]).then(([pool, p]) => {
+    onLog(`Plan ready: "${p.title}" · ${p.scenes.length} scene(s)`);
+    return [pool, p] as const;
+  });
+
+  const { poolMeta, usedUpload, poolLabel } = broll;
+
+  plan.fullNarration = clampNarrationForShort(plan.fullNarration, onLog);
+  plan.estimatedDuration = Math.min(
+    MAX_SHORTS_DURATION_SEC,
+    Math.max(20, Math.round(plan.fullNarration.length / 18))
+  );
 
   const gender = voiceGender === "male" || voiceGender === "female" ? voiceGender : "female";
   onLog(
@@ -610,6 +732,7 @@ async function renderWithFfmpeg(
     voicePath,
     assPath,
     outPath,
+    workDir,
     voiceSec,
     playbackSpeed: speed,
     onLog,

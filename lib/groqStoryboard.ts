@@ -161,36 +161,30 @@ The listener should experience every important moment exactly as it happened.
 ${languageDirective(lang)}
 
 PRIMARY RULE
-• Preserve EVERY important event.
-• Do not remove plot points.
-• Do not merge important events together.
-• Do not skip confrontations, twists, dialogue, emotional moments, decisions, consequences, callbacks, or ending payoffs.
-• Do not invent new events.
-• Do not change the order.
-• Output = SAME STORY with smoother spoken wording.
-• If the input would take ~5 minutes to tell, fullNarration should also be ~5 minutes of speech.
-• Only remove repetitive descriptions that do not affect the story.
-• Never shorten major events.
-• Target 95–100% story coverage — feel like the original person telling it, not a Reddit summary.
+• Preserve every important event that fits a ~45–55 second Short.
+• Do not invent new events or change the order.
+• Output = SAME STORY with smoother spoken wording — punchy, not a 5-minute retell.
+• Target spoken length ≈ 45–55 seconds (~900–1100 English characters / similar Hindi).
+• Prefer the strongest beats: hook → conflict → twist/payoff → ending. Drop only repetitive filler and side details that do not change the plot.
+• Never invent clickbait or fake endings.
 
 NARRATION STYLE
 • FIRST PERSON only.
 • Natural spoken English (or Hindi per LANGUAGE). Contractions. Short sentences. Natural pauses.
 • Never sound like a novel, Wikipedia, an AI, or a movie trailer.
-• Never summarize what happened — the audience discovers the story as it unfolds.
+• Never summarize what happened — the audience discovers the story as it unfolds. Keep it TIGHT for Shorts.
 
-MANDATORY BEATS (when present in the input)
+MANDATORY BEATS (when present in the input — keep if they fit the time budget)
 confrontation · dialogue · betrayal · reveal · emotional reaction · plot twist · consequence · decision · callback · ending payoff
-Each MUST appear. Example: Mother refuses food → Trevor gets seconds → silence → they leave → father texts about rent = ALL FIVE beats, never collapsed into one summary line.
+If the source is very long, keep the spine of those beats; do not pad.
 
 HOOK
 • If the original already starts with a strong hook, KEEP IT (grammar polish only).
 • Do not invent clickbait.
 
 PACING
-• Tell naturally. Do not rush. Do not compress multiple scenes into one.
-• One meaningful event = one scene / narration chunk.
-• If there are ~25 important moments, use ~25 chunks (use as many scenes as needed; typically 8–40).
+• Fast Shorts pacing. One meaningful event = one scene / narration chunk.
+• Prefer 6–14 scenes. estimatedDuration should be 45–55.
 
 EMOTION
 • Do not exaggerate. Show, don't tell.
@@ -205,6 +199,7 @@ SCENES
 • Chunks concatenate in order into fullNarration (no repeats, no mini-summaries).
 • Each scene: one narration chunk + emotion + rough durationSec + pexelsQuery (3–6 concrete English words) + imagePrompt (cinematic still, no text/celebrities) + optional captionHighlightWords (1–3) + camera/captionStyle/transition/soundEffect.
 • durationSec / startSec are rough only — code will retime.
+• Keep fullNarration under ~1100 characters so the finished Short stays under 1 minute.
 
 JSON ONLY (no markdown). Escape every " inside strings as \\". Example dialogue: "She said \\"Leave.\\""
 {
@@ -240,9 +235,10 @@ function buildUserPrompt(lang: StoryLang, storyBody: string): string {
   const langLabel = lang === "hi" ? "Hindi Devanagari" : "English";
   return `RETELL this raw dump as a ${langLabel} first-person spoken recollection (JSON only).
 
-Do NOT summarize. Do NOT invent events. Do NOT skip confrontations, dialogue, twists, or the original ending.
-Preserve every important beat in order. Spoken length should match the source story (longer input → longer fullNarration).
-Use as many scene chunks as needed (one meaningful event per chunk).
+Keep the finished Short under ~55 seconds of speech (~900–1100 characters).
+Preserve the story spine (hook → conflict → twist/payoff → ending). Do NOT invent events.
+Drop only repetitive filler / side details that do not change the plot.
+Use 6–14 scene chunks (one meaningful event per chunk). estimatedDuration should be 45–55.
 
 RAW STORY:
 ---
@@ -680,9 +676,9 @@ function finalizePlan(plan: StoryPlan, sourceStory: string): StoryPlan {
   const coverage =
     plan.fullNarration.replace(/\s+/g, " ").trim().length /
     Math.max(1, sourceStory.replace(/\s+/g, " ").trim().length);
-  if (coverage < 0.45) {
+  if (coverage < 0.12) {
     console.warn(
-      `[story-planner] Narration looks short vs input (coverage≈${(coverage * 100).toFixed(0)}%). Check fullNarration for missing beats.`
+      `[story-planner] Narration looks very short vs input (coverage≈${(coverage * 100).toFixed(0)}%). Shorts target is ≤55s speech.`
     );
   }
   return plan;

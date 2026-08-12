@@ -9,9 +9,8 @@ import { buildStoryVideo } from "@/lib/storyVideoPipeline";
 import { fetchYoutubeStoryText } from "@/lib/youtubeTranscript";
 
 export const runtime = "nodejs";
-/** Longer narrations (2–6 min) need more headroom than default. */
-/** Vercel Hobby max is 300s; Pro allows higher. */
-export const maxDuration = 300;
+/** Keep jobs under ~2 min wall clock (Hobby allows up to 300). */
+export const maxDuration = 120;
 
 type LogEntry = { level: "info" | "error"; message: string };
 
@@ -40,13 +39,13 @@ function parseStorySpeed(raw: unknown): {
 } {
   const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   if (!s || s === "auto") {
-    return { storySpeed: 1.35, autoFitSpeed: true };
+    return { storySpeed: 1.5, autoFitSpeed: true };
   }
   const n = Number(s);
   if (Number.isFinite(n) && n >= 1 && n <= 2.5) {
     return { storySpeed: n, autoFitSpeed: true };
   }
-  return { storySpeed: 1.35, autoFitSpeed: true };
+  return { storySpeed: 1.5, autoFitSpeed: true };
 }
 
 /**

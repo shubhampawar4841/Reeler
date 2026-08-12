@@ -45,6 +45,36 @@ async function getKokoroTts(): Promise<KokoroInstance> {
   return ttsPromise;
 }
 
+/** Start ONNX load early so it overlaps Gemini/B-roll. */
+export function warmKokoroTts(): Promise<KokoroInstance> {
+  return getKokoroTts();
+}
+
+/** Run async work over items with a fixed concurrency cap (order-preserving results). */
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const n = items.length;
+  const results = new Array<R>(n);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, n) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= n) return;
+      results[i] = await fn(items[i]!, i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+const TTS_SEGMENT_CONCURRENCY = Math.max(
+  1,
+  Math.min(4, Number(process.env.TTS_SEGMENT_CONCURRENCY) || 4)
+);
+
 function resolveEnVoice(override?: string | null): string {
   if (override?.trim()) return override.trim();
   return process.env.KOKORO_VOICE?.trim() || "af_heart";
@@ -69,7 +99,8 @@ export function voiceIdForGender(lang: StoryLang, gender: VoiceGender): string {
 function resolveSpeed(): number {
   const raw = Number(process.env.KOKORO_SPEED);
   if (Number.isFinite(raw) && raw >= 0.5 && raw <= 2) return raw;
-  return 1.18;
+  // Faster default → shorter WAV → faster Whisper/encode (≤59s target).
+  return 1.45;
 }
 
 function runFfmpeg(args: string[]): Promise<void> {
@@ -195,11 +226,9 @@ async function synthesizeKokoroEn(
       // Phoneme limit: generate sentence groups, then stitch into one continuous WAV.
       const parts = splitForTts(text, KOKORO_ONE_SHOT_MAX_CHARS);
       onLog?.(
-        `Kokoro EN ${parts.length} generate() segment(s) → single continuous WAV`
+        `Kokoro EN ${parts.length} generate() segment(s) @ concurrency=${TTS_SEGMENT_CONCURRENCY} → single continuous WAV`
       );
-      const partPaths: string[] = [];
-      for (let i = 0; i < parts.length; i++) {
-        const piece = parts[i]!;
+      const partPaths = await mapPool(parts, TTS_SEGMENT_CONCURRENCY, async (piece, i) => {
         const part = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
         const audio = await tts.generate(piece, {
           voice: voice as "af_bella",
@@ -209,8 +238,8 @@ async function synthesizeKokoroEn(
         onLog?.(
           `  segment ${i + 1}/${parts.length}: "${piece.slice(0, 50)}${piece.length > 50 ? "…" : ""}"`
         );
-        partPaths.push(part);
-      }
+        return part;
+      });
       await concatWavParts(partPaths, outPath);
     }
 
@@ -252,12 +281,15 @@ async function synthesizeEdgeHi(
   await fs.mkdir(workDir, { recursive: true });
 
   try {
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
     const rate = resolveSpeed();
 
-    const synthesizePiece = async (piece: string, wavDest: string) => {
-      const { audioFilePath } = await tts.toFile(workDir, piece, { rate });
+    /** Fresh Edge client per piece — safe under parallel mapPool. */
+    const synthesizePiece = async (piece: string, wavDest: string, idx: number) => {
+      const pieceDir = path.join(workDir, `edge-${String(idx).padStart(3, "0")}`);
+      await fs.mkdir(pieceDir, { recursive: true });
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      const { audioFilePath } = await tts.toFile(pieceDir, piece, { rate });
       await runFfmpeg([
         "-y",
         "-i",
@@ -271,30 +303,28 @@ async function synthesizeEdgeHi(
         wavDest,
       ]);
       try {
-        await fs.unlink(audioFilePath);
+        await fs.rm(pieceDir, { recursive: true, force: true });
       } catch {
         /* ignore */
       }
     };
 
     if (text.length <= EDGE_ONE_SHOT_MAX_CHARS) {
-      await synthesizePiece(text, outPathWav);
+      await synthesizePiece(text, outPathWav, 0);
       onLog?.(`Hindi Edge one-shot generate (${text.length} chars)`);
     } else {
       const parts = splitForTts(text, EDGE_ONE_SHOT_MAX_CHARS);
       onLog?.(
-        `Hindi Edge ${parts.length} generate() segment(s) → single continuous WAV`
+        `Hindi Edge ${parts.length} generate() segment(s) @ concurrency=${TTS_SEGMENT_CONCURRENCY} → single continuous WAV`
       );
-      const partPaths: string[] = [];
-      for (let i = 0; i < parts.length; i++) {
-        const piece = parts[i]!;
+      const partPaths = await mapPool(parts, TTS_SEGMENT_CONCURRENCY, async (piece, i) => {
         const wav = path.join(workDir, `part-${String(i).padStart(3, "0")}.wav`);
-        await synthesizePiece(piece, wav);
+        await synthesizePiece(piece, wav, i);
         onLog?.(
           `  segment ${i + 1}/${parts.length}: "${piece.slice(0, 50)}${piece.length > 50 ? "…" : ""}"`
         );
-        partPaths.push(wav);
-      }
+        return wav;
+      });
       if (partPaths.length === 0) throw new Error("Edge TTS produced no audio.");
       await concatWavParts(partPaths, outPathWav);
     }
