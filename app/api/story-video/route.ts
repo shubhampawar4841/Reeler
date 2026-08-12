@@ -10,7 +10,8 @@ import { fetchYoutubeStoryText } from "@/lib/youtubeTranscript";
 
 export const runtime = "nodejs";
 /** Longer narrations (2–6 min) need more headroom than default. */
-export const maxDuration = 600;
+/** Vercel Hobby max is 300s; Pro allows higher. */
+export const maxDuration = 300;
 
 type LogEntry = { level: "info" | "error"; message: string };
 
