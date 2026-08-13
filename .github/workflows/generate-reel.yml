@@ -1,0 +1,75 @@
+# Manual reel generation + YouTube upload (no cron).
+# Repo root = my-app (package.json lives here).
+
+name: Generate Reel
+
+on:
+  workflow_dispatch:
+    inputs:
+      story:
+        description: "Story text for the Short (≥20 characters)"
+        required: true
+        type: string
+      lang:
+        description: "Language (en or hi)"
+        required: false
+        default: "en"
+        type: choice
+        options:
+          - en
+          - hi
+      privacy:
+        description: "YouTube privacy status"
+        required: false
+        default: "private"
+        type: choice
+        options:
+          - private
+          - unlisted
+          - public
+      gender:
+        description: "Voice gender"
+        required: false
+        default: "female"
+        type: choice
+        options:
+          - female
+          - male
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Generate reel and upload to YouTube
+        env:
+          STORY_RENDERER: ffmpeg
+          TTS_ENGINE: edge
+          STORY_TEXT: ${{ inputs.story }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: >
+          npx tsx scripts/generate-and-upload-reel.ts
+          --story "$STORY_TEXT"
+          --lang "${{ inputs.lang }}"
+          --privacy "${{ inputs.privacy }}"
+          --gender "${{ inputs.gender }}"
