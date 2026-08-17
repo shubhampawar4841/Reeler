@@ -1,6 +1,6 @@
 /**
  * B-roll sources for story Shorts — Supabase public URLs by default.
- * Pipeline seeks only the needed trim (-ss / -t) — never downloads whole remotes to disk.
+ * Remote URLs are downloaded to a temp file before FFmpeg (CI-safe HTTPS).
  * Set BROLL_INCLUDE_LOCAL=1 to also list public/*.mp4.
  */
 

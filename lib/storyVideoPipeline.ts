@@ -28,6 +28,7 @@ import {
   REMOTE_BROLL,
   type BrollCatalogItem,
 } from "@/lib/brollCatalog";
+import { downloadToFile } from "@/lib/pexels";
 
 export type StoryVideoLog = (msg: string) => void;
 
@@ -208,10 +209,11 @@ type PreparedStoryAssets = {
   autoFitSpeed: boolean;
 };
 
-/** Resolve one B-roll source — prefer seekable local/URL, never full remote download. */
+/** Resolve one B-roll source. Remotes are downloaded into workDir for reliable FFmpeg on CI. */
 async function resolveBrollPool(
   options: BuildStoryVideoOptions,
-  onLog: StoryVideoLog
+  onLog: StoryVideoLog,
+  workDir: string
 ): Promise<{ poolMeta: BrollPoolItem[]; usedUpload: boolean; poolLabel: string }> {
   const uploadPath = options.backgroundVideoPath?.trim() || "";
   if (uploadPath) {
@@ -247,14 +249,24 @@ async function resolveBrollPool(
     );
   }
 
-  const ffmpegSrc = brollFfmpegInput(picked);
-  onLog(
-    picked.kind === "local"
-      ? `Seeking local file (no copy): ${picked.src}`
-      : `Seeking remote URL (no full download): ${picked.id}`
-  );
+  let ffmpegSrc = brollFfmpegInput(picked);
+  if (picked.kind === "remote" || /^https?:\/\//i.test(ffmpegSrc)) {
+    const localPath = path.join(workDir, "broll-remote.mp4");
+    onLog(`Downloading remote B-roll to temp (${picked.id})…`);
+    await downloadToFile(ffmpegSrc, localPath, {
+      timeoutMs: 120_000,
+      retries: 3,
+    });
+    ffmpegSrc = localPath;
+    onLog(`Remote B-roll saved locally for FFmpeg`);
+  } else {
+    onLog(`Seeking local file (no copy): ${picked.src}`);
+  }
+
   const dur = await probeDurationSec(ffmpegSrc);
-  onLog(`B-roll duration ${dur.toFixed(1)}s — FFmpeg will -ss / -t the needed window only`);
+  onLog(
+    `B-roll duration ${dur.toFixed(1)}s — FFmpeg will -ss / -t the needed window only`
+  );
 
   return {
     usedUpload: false,
@@ -631,7 +643,7 @@ async function prepareStoryAssets(
       : Promise.resolve();
 
   const [broll, plan] = await Promise.all([
-    resolveBrollPool(options, onLog),
+    resolveBrollPool(options, onLog, workDir),
     planStoryWithGroq(story, lang),
     warmTts,
   ]).then(([pool, p]) => {
