@@ -3,6 +3,15 @@ name: Generate Reel
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "What to run"
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - transcript_only
+
       story:
         description: "Optional story text. Leave empty to auto-fetch a YouTube transcript."
         required: false
@@ -12,6 +21,12 @@ on:
         description: "Optional YouTube URL/ID to pull transcript from (manual testing)."
         required: false
         type: string
+
+      force_random:
+        description: "Ignore story/youtube_url and force a random channel transcript fetch."
+        required: false
+        default: false
+        type: boolean
 
       lang:
         description: "Language"
@@ -117,6 +132,8 @@ jobs:
         id: story
         env:
           EVENT_NAME: ${{ github.event_name }}
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'full' }}
+          FORCE_RANDOM: ${{ github.event_name == 'workflow_dispatch' && inputs.force_random || false }}
           # Only use form inputs on manual runs (cron has no inputs)
           STORY_TEXT: ${{ github.event_name == 'workflow_dispatch' && inputs.story || '' }}
           YT_VIDEO_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.youtube_url || '' }}
@@ -132,6 +149,8 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/reeler
           echo "Event: $EVENT_NAME"
+          echo "Mode: ${RUN_MODE:-full}"
+          echo "Force random: ${FORCE_RANDOM:-false}"
           if [ -n "${YT_DLP_COOKIES:-}" ]; then
             printf '%s\n' "$YT_DLP_COOKIES" > /tmp/reeler/youtube-cookies.txt
             export YT_DLP_COOKIES_FILE=/tmp/reeler/youtube-cookies.txt
@@ -139,10 +158,16 @@ jobs:
           else
             echo "yt-dlp cookies: missing (set secret YT_DLP_COOKIES if CI gets bot-blocked)"
           fi
-          # Cron / schedule → always auto YouTube transcript (ignore empty inputs)
-          if [ "$EVENT_NAME" = "schedule" ] || [ -z "${STORY_TEXT:-}" ]; then
-            echo "Auto mode: random configured channel → transcript → story input"
-            if [ "$EVENT_NAME" != "schedule" ] && [ -n "${YT_VIDEO_URL:-}" ]; then
+
+          # Cron, transcript-only, force_random, or empty story → fetch from YouTube.
+          if [ "$EVENT_NAME" = "schedule" ] \
+            || [ "${RUN_MODE:-full}" = "transcript_only" ] \
+            || [ "${FORCE_RANDOM:-false}" = "true" ] \
+            || [ -z "${STORY_TEXT:-}" ]; then
+
+            if [ "$EVENT_NAME" != "schedule" ] \
+              && [ "${FORCE_RANDOM:-false}" != "true" ] \
+              && [ -n "${YT_VIDEO_URL:-}" ]; then
               echo "Using manually supplied YouTube URL."
               npx tsx scripts/fetch-youtube-story.ts \
                 --youtube-url "$YT_VIDEO_URL" \
@@ -150,7 +175,7 @@ jobs:
                 --out /tmp/reeler/story.txt \
                 --meta /tmp/reeler/meta.json
             else
-              echo "Discovering a YouTube video with captions..."
+              echo "Discovering a random YouTube video with captions..."
               npx tsx scripts/fetch-youtube-story.ts \
                 --lang "$LANG_INPUT" \
                 --out /tmp/reeler/story.txt \
@@ -160,6 +185,10 @@ jobs:
             echo "----------- SOURCE METADATA -----------"
             cat /tmp/reeler/meta.json
             echo "---------------------------------------"
+            echo "----------- STORY PREVIEW (first 400 chars) -----------"
+            head -c 400 /tmp/reeler/story.txt || true
+            echo
+            echo "-------------------------------------------------------"
             wc -c /tmp/reeler/story.txt
           else
             echo "Using manually supplied story."
@@ -172,6 +201,7 @@ jobs:
       # 6. Generate video + upload to YouTube
       # --------------------------------------------------
       - name: Generate reel and upload to YouTube
+        if: ${{ github.event_name == 'schedule' || inputs.mode != 'transcript_only' }}
         env:
           # Use the lightweight GitHub Actions configuration.
           STORY_RENDERER: ffmpeg
