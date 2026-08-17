@@ -115,17 +115,13 @@ jobs:
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
 
-          # Prefer narration-style videos (more likely to have usable captions)
-          YT_SEARCH_QUERIES: "scary story narration english captions|nosleep story reading narration|creepypasta narration english|true scary story told by narrator|reddit scary story narration full|paranormal experience story narration|horror story audiobook short"
-
         run: |
           set -euo pipefail
           mkdir -p /tmp/reeler
           echo "Event: $EVENT_NAME"
           # Cron / schedule → always auto YouTube transcript (ignore empty inputs)
           if [ "$EVENT_NAME" = "schedule" ] || [ -z "${STORY_TEXT:-}" ]; then
-            echo "Auto mode: YouTube search → transcript → story input"
-            echo "Queries: $YT_SEARCH_QUERIES"
+            echo "Auto mode: random configured channel → transcript → story input"
             if [ "$EVENT_NAME" != "schedule" ] && [ -n "${YT_VIDEO_URL:-}" ]; then
               echo "Using manually supplied YouTube URL."
               npx tsx scripts/fetch-youtube-story.ts \
