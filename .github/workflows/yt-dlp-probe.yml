@@ -1,0 +1,72 @@
+# Diagnostic only: checks which yt-dlp player clients can pull captions
+# from a GitHub-hosted runner. Safe to delete once CI transcripts work.
+
+name: yt-dlp probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "YouTube video id to probe"
+        required: false
+        default: "IYZIKyZo7zM"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install --user -U yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Probe player clients
+        env:
+          VIDEO_ID: ${{ inputs.video_id || 'IYZIKyZo7zM' }}
+          YT_DLP_COOKIES: ${{ secrets.YT_DLP_COOKIES }}
+        run: |
+          set -uo pipefail
+          yt-dlp --version
+          URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+
+          COOKIE_ARGS=()
+          if [ -n "${YT_DLP_COOKIES:-}" ]; then
+            printf '%s\n' "$YT_DLP_COOKIES" > /tmp/yt-cookies.txt
+            COOKIE_ARGS=(--cookies /tmp/yt-cookies.txt)
+            echo "Cookies secret: present"
+          else
+            echo "Cookies secret: absent"
+          fi
+
+          FAILED=0
+          for CLIENT in android_vr android tv_embedded ios mweb web_safari web; do
+            echo "=============================================="
+            echo "Client: $CLIENT"
+            rm -rf /tmp/probe && mkdir -p /tmp/probe
+            if yt-dlp \
+              --extractor-args "youtube:player_client=${CLIENT}" \
+              --skip-download \
+              --write-auto-subs \
+              --write-subs \
+              --sub-langs "en.*,en,hi.*,hi,a.en*,a.hi*" \
+              --sub-format "vtt/srt/best" \
+              --no-playlist \
+              -o "/tmp/probe/%(id)s" \
+              "${COOKIE_ARGS[@]}" \
+              "$URL" 2>&1 | tail -n 12
+            then
+              COUNT=$(find /tmp/probe -type f \( -name '*.vtt' -o -name '*.srt' \) | wc -l)
+              echo "RESULT $CLIENT: exit ok, subtitle files=$COUNT"
+              find /tmp/probe -type f | head -n 5
+            else
+              echo "RESULT $CLIENT: FAILED"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo "=============================================="
+          echo "Clients failed: $FAILED"
+          rm -f /tmp/yt-cookies.txt

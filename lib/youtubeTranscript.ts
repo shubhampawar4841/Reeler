@@ -135,6 +135,7 @@ async function fetchViaYtDlp(
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "reeler-subs-"));
   const outTpl = path.join(workDir, videoId);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const cookiesFile = process.env.YT_DLP_COOKIES_FILE?.trim() || "";
 
   // Prefer matching lang, then common auto tracks, then any.
   // On CI use a broader set — many Hindi channels only expose auto tracks.
@@ -147,35 +148,40 @@ async function fetchViaYtDlp(
         ? "hi.*,hi,en.*,en,a.hi,a.en"
         : "en.*,en,hi.*,hi,a.en,a.hi";
 
+  const args = [
+    "--skip-download",
+    "--write-auto-subs",
+    "--write-subs",
+    "--sub-langs",
+    langPref,
+    "--sub-format",
+    "vtt/srt/best",
+    // GitHub runner IPs often get blocked on the default web client.
+    "--extractor-args",
+    "youtube:player_client=android,tv_embedded,web",
+    "-o",
+    outTpl,
+    "--no-warnings",
+    "--no-playlist",
+  ];
+  if (cookiesFile) {
+    args.push("--cookies", cookiesFile);
+  }
+  args.push(url);
+
   try {
     try {
-      await execFileAsync(
-        bin,
-        [
-          "--skip-download",
-          "--write-auto-subs",
-          "--write-subs",
-          "--sub-langs",
-          langPref,
-          "--sub-format",
-          "vtt/srt/best",
-          // GitHub runner IPs often get blocked on the default web client.
-          "--extractor-args",
-          "youtube:player_client=android,tv_embedded,web",
-          "-o",
-          outTpl,
-          "--no-warnings",
-          "--no-playlist",
-          url,
-        ],
-        {
-          windowsHide: true,
-          timeout: 90_000,
-          maxBuffer: 8 * 1024 * 1024,
-        }
-      );
+      await execFileAsync(bin, args, {
+        windowsHide: true,
+        timeout: 90_000,
+        maxBuffer: 8 * 1024 * 1024,
+      });
     } catch (e) {
-      const err = e as { message?: string; stderr?: string | Buffer; stdout?: string | Buffer };
+      const err = e as {
+        message?: string;
+        stderr?: string | Buffer;
+        stdout?: string | Buffer;
+      };
       const stderr = Buffer.isBuffer(err.stderr)
         ? err.stderr.toString("utf8")
         : String(err.stderr ?? "");
@@ -185,7 +191,11 @@ async function fetchViaYtDlp(
       const detail = (stderr || stdout || err.message || "yt-dlp failed")
         .trim()
         .slice(-500);
-      throw new Error(`yt-dlp failed: ${detail}`);
+      const hint =
+        /confirm you.re not a bot/i.test(detail) && !cookiesFile
+          ? " Set GitHub secret YT_DLP_COOKIES (Netscape cookies.txt) to unblock CI."
+          : "";
+      throw new Error(`yt-dlp failed: ${detail}${hint}`);
     }
 
     const entries = await fs.readdir(workDir);

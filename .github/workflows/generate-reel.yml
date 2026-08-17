@@ -125,11 +125,20 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # Netscape cookies.txt contents — required on GitHub runners (bot check).
+          YT_DLP_COOKIES: ${{ secrets.YT_DLP_COOKIES }}
 
         run: |
           set -euo pipefail
           mkdir -p /tmp/reeler
           echo "Event: $EVENT_NAME"
+          if [ -n "${YT_DLP_COOKIES:-}" ]; then
+            printf '%s\n' "$YT_DLP_COOKIES" > /tmp/reeler/youtube-cookies.txt
+            export YT_DLP_COOKIES_FILE=/tmp/reeler/youtube-cookies.txt
+            echo "yt-dlp cookies: enabled"
+          else
+            echo "yt-dlp cookies: missing (set secret YT_DLP_COOKIES if CI gets bot-blocked)"
+          fi
           # Cron / schedule → always auto YouTube transcript (ignore empty inputs)
           if [ "$EVENT_NAME" = "schedule" ] || [ -z "${STORY_TEXT:-}" ]; then
             echo "Auto mode: random configured channel → transcript → story input"
@@ -158,6 +167,7 @@ jobs:
             echo "source=manual" >> "$GITHUB_OUTPUT"
             echo "Story length: ${#STORY_TEXT} characters"
           fi
+          rm -f /tmp/reeler/youtube-cookies.txt
       # --------------------------------------------------
       # 6. Generate video + upload to YouTube
       # --------------------------------------------------
