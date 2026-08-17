@@ -1,9 +1,17 @@
 /**
- * Fetch YouTube captions via youtube-transcript (unofficial API).
- * Returns plain text suitable as the raw story input for the planner.
+ * Fetch YouTube captions.
+ * Primary: youtube-transcript (works locally).
+ * Fallback: yt-dlp (needed on GitHub Actions — YouTube blocks the scrape API from runner IPs).
  */
 
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 import { fetchTranscript } from "youtube-transcript";
+
+const execFileAsync = promisify(execFile);
 
 export type YoutubeTranscriptSegment = {
   text: string;
@@ -60,22 +68,167 @@ function segmentsToPlainText(segments: YoutubeTranscriptSegment[]): string {
     .trim();
 }
 
-/**
- * Pull captions for a YouTube URL/ID and flatten to one story string.
- * Prefers the video's default caption language from YouTube.
- */
-export async function fetchYoutubeStoryText(
-  youtubeUrlOrId: string,
-  opts?: { lang?: "en" | "hi" }
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
+}
+
+/** Strip VTT/SRT cue markup into plain narration text. */
+function subtitleFileToPlainText(raw: string): string {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  const chunks: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (/^WEBVTT/i.test(t)) continue;
+    if (/^NOTE\b/i.test(t)) continue;
+    if (/^KIND:/i.test(t)) continue;
+    if (/^LANGUAGE:/i.test(t)) continue;
+    if (/^\d+$/.test(t)) continue; // SRT cue index
+    if (/^\d{2}:\d{2}:\d{2}[.,]\d{3}\s+-->\s+/.test(t)) continue;
+    if (/-->/.test(t)) continue;
+    const cleaned = decodeEntities(t.replace(/<[^>]+>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (cleaned) chunks.push(cleaned);
+  }
+  // Drop consecutive duplicates common in auto-captions
+  const deduped: string[] = [];
+  for (const c of chunks) {
+    if (deduped[deduped.length - 1] === c) continue;
+    deduped.push(c);
+  }
+  return deduped.join(" ").replace(/\s+/g, " ").trim();
+}
+
+async function resolveYtDlpBin(): Promise<string | null> {
+  const fromEnv = process.env.YT_DLP_PATH?.trim();
+  if (fromEnv) return fromEnv;
+  for (const bin of ["yt-dlp", "yt-dlp.exe"]) {
+    try {
+      await execFileAsync(bin, ["--version"], {
+        windowsHide: true,
+        timeout: 15_000,
+      });
+      return bin;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+async function fetchViaYtDlp(
+  videoId: string,
+  lang?: "en" | "hi"
 ): Promise<FetchYoutubeStoryResult> {
-  const videoId = extractYoutubeVideoId(youtubeUrlOrId);
-  if (!videoId) {
-    throw new Error(
-      "Invalid YouTube link. Paste a watch/shorts URL or an 11-character video id."
-    );
+  const bin = await resolveYtDlpBin();
+  if (!bin) {
+    throw new Error("yt-dlp is not installed (needed for CI transcript fallback)");
   }
 
-  const lang = opts?.lang;
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "reeler-subs-"));
+  const outTpl = path.join(workDir, videoId);
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // Prefer matching lang, then common auto tracks, then any.
+  const langPref =
+    lang === "hi"
+      ? "hi.*,hi,en.*,en,a.hi,a.en"
+      : "en.*,en,hi.*,hi,a.en,a.hi";
+
+  try {
+    await execFileAsync(
+      bin,
+      [
+        "--skip-download",
+        "--write-auto-subs",
+        "--write-subs",
+        "--sub-langs",
+        langPref,
+        "--sub-format",
+        "vtt/srt/best",
+        "--convert-subs",
+        "vtt",
+        "-o",
+        outTpl,
+        "--no-warnings",
+        url,
+      ],
+      {
+        windowsHide: true,
+        timeout: 90_000,
+        maxBuffer: 8 * 1024 * 1024,
+      }
+    );
+
+    const entries = await fs.readdir(workDir);
+    const subFiles = entries
+      .filter((f) => /\.(vtt|srt)$/i.test(f))
+      .sort((a, b) => {
+        // Prefer exact lang matches first
+        const score = (name: string) => {
+          const n = name.toLowerCase();
+          if (lang === "hi") {
+            if (n.includes(".hi.")) return 0;
+            if (n.includes(".en.")) return 1;
+          } else {
+            if (n.includes(".en.")) return 0;
+            if (n.includes(".hi.")) return 1;
+          }
+          return 2;
+        };
+        return score(a) - score(b);
+      });
+
+    if (!subFiles.length) {
+      throw new Error("yt-dlp wrote no subtitle files");
+    }
+
+    const chosen = subFiles[0]!;
+    const raw = await fs.readFile(path.join(workDir, chosen), "utf8");
+    const text = subtitleFileToPlainText(raw);
+    if (text.length < 20) {
+      throw new Error(`yt-dlp subtitle too short (${text.length} chars) from ${chosen}`);
+    }
+
+    // Rough duration: count unique cue timestamps if present; else estimate by words.
+    const cueMatches = [
+      ...raw.matchAll(/(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s+-->/g),
+    ];
+    let durationSec = 0;
+    if (cueMatches.length) {
+      const last = cueMatches[cueMatches.length - 1]!;
+      durationSec =
+        Number(last[1]) * 3600 +
+        Number(last[2]) * 60 +
+        Number(last[3]) +
+        Number(last[4]) / 1000;
+    } else {
+      durationSec = Math.max(20, Math.round(text.split(/\s+/).length / 2.5));
+    }
+
+    return {
+      videoUrl: url,
+      videoId,
+      text,
+      segmentCount: Math.max(1, Math.round(text.split(/\s+/).length / 8)),
+      durationSec,
+    };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function fetchViaPackage(
+  videoId: string,
+  lang?: "en" | "hi"
+): Promise<FetchYoutubeStoryResult> {
   let segments: YoutubeTranscriptSegment[];
   try {
     const raw = await fetchTranscript(videoId, lang ? { lang } : undefined);
@@ -102,7 +255,9 @@ export async function fetchYoutubeStoryText(
 
   const text = segmentsToPlainText(segments);
   if (text.length < 20) {
-    throw new Error("Transcript is too short to build a story (~20+ characters needed).");
+    throw new Error(
+      "Transcript is too short to build a story (~20+ characters needed)."
+    );
   }
 
   const last = segments[segments.length - 1]!;
@@ -122,4 +277,41 @@ export async function fetchYoutubeStoryText(
     segmentCount: segments.length,
     durationSec,
   };
+}
+
+/**
+ * Pull captions for a YouTube URL/ID and flatten to one story string.
+ * On GitHub Actions, prefers yt-dlp because youtube-transcript is IP-blocked.
+ */
+export async function fetchYoutubeStoryText(
+  youtubeUrlOrId: string,
+  opts?: { lang?: "en" | "hi" }
+): Promise<FetchYoutubeStoryResult> {
+  const videoId = extractYoutubeVideoId(youtubeUrlOrId);
+  if (!videoId) {
+    throw new Error(
+      "Invalid YouTube link. Paste a watch/shorts URL or an 11-character video id."
+    );
+  }
+
+  const lang = opts?.lang;
+  const onCi = process.env.GITHUB_ACTIONS === "true";
+  const preferYtDlp = onCi || process.env.YT_TRANSCRIPT_ENGINE === "ytdlp";
+
+  const attempts: Array<() => Promise<FetchYoutubeStoryResult>> = preferYtDlp
+    ? [() => fetchViaYtDlp(videoId, lang), () => fetchViaPackage(videoId, lang)]
+    : [() => fetchViaPackage(videoId, lang), () => fetchViaYtDlp(videoId, lang)];
+
+  const errors: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      return await attempt();
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  throw new Error(
+    `Could not fetch YouTube transcript for ${videoId}. ${errors.join(" | ")}`
+  );
 }

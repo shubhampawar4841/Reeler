@@ -81,13 +81,17 @@ jobs:
       # --------------------------------------------------
       # 3. Install FFmpeg
       # --------------------------------------------------
-      - name: Install FFmpeg
+      - name: Install FFmpeg + yt-dlp
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           # Full apt build (complete TLS/protocol support) instead of ffmpeg-static.
           echo "FFMPEG_PATH=$(command -v ffmpeg)" >> "$GITHUB_ENV"
           ffmpeg -version | head -n 1
+          # youtube-transcript is IP-blocked on GitHub runners; yt-dlp fetches captions reliably.
+          python3 -m pip install --user -U yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          yt-dlp --version
       # --------------------------------------------------
       # 4. Install project dependencies
       #
