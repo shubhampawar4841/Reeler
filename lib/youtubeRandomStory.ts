@@ -94,7 +94,7 @@ export async function findRandomYoutubeStory(
       } catch (error) {
         // Many source videos have captions disabled; try another one.
         const reason = error instanceof Error ? error.message : String(error);
-        onLog(`  ${video.videoId}: ${reason.slice(0, 180)}`);
+        onLog(`  ${video.videoId}: ${reason.slice(0, 400)}`);
         lastTranscriptError = reason;
       }
     }

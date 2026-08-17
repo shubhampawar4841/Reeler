@@ -137,35 +137,56 @@ async function fetchViaYtDlp(
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   // Prefer matching lang, then common auto tracks, then any.
+  // On CI use a broader set — many Hindi channels only expose auto tracks.
   const langPref =
-    lang === "hi"
-      ? "hi.*,hi,en.*,en,a.hi,a.en"
-      : "en.*,en,hi.*,hi,a.en,a.hi";
+    process.env.GITHUB_ACTIONS === "true" || process.env.YT_TRANSCRIPT_ENGINE === "ytdlp"
+      ? lang === "hi"
+        ? "hi.*,hi,en.*,en,a.hi*,a.en*,all"
+        : "en.*,en,hi.*,hi,a.en*,a.hi*,all"
+      : lang === "hi"
+        ? "hi.*,hi,en.*,en,a.hi,a.en"
+        : "en.*,en,hi.*,hi,a.en,a.hi";
 
   try {
-    await execFileAsync(
-      bin,
-      [
-        "--skip-download",
-        "--write-auto-subs",
-        "--write-subs",
-        "--sub-langs",
-        langPref,
-        "--sub-format",
-        "vtt/srt/best",
-        "--convert-subs",
-        "vtt",
-        "-o",
-        outTpl,
-        "--no-warnings",
-        url,
-      ],
-      {
-        windowsHide: true,
-        timeout: 90_000,
-        maxBuffer: 8 * 1024 * 1024,
-      }
-    );
+    try {
+      await execFileAsync(
+        bin,
+        [
+          "--skip-download",
+          "--write-auto-subs",
+          "--write-subs",
+          "--sub-langs",
+          langPref,
+          "--sub-format",
+          "vtt/srt/best",
+          // GitHub runner IPs often get blocked on the default web client.
+          "--extractor-args",
+          "youtube:player_client=android,tv_embedded,web",
+          "-o",
+          outTpl,
+          "--no-warnings",
+          "--no-playlist",
+          url,
+        ],
+        {
+          windowsHide: true,
+          timeout: 90_000,
+          maxBuffer: 8 * 1024 * 1024,
+        }
+      );
+    } catch (e) {
+      const err = e as { message?: string; stderr?: string | Buffer; stdout?: string | Buffer };
+      const stderr = Buffer.isBuffer(err.stderr)
+        ? err.stderr.toString("utf8")
+        : String(err.stderr ?? "");
+      const stdout = Buffer.isBuffer(err.stdout)
+        ? err.stdout.toString("utf8")
+        : String(err.stdout ?? "");
+      const detail = (stderr || stdout || err.message || "yt-dlp failed")
+        .trim()
+        .slice(-500);
+      throw new Error(`yt-dlp failed: ${detail}`);
+    }
 
     const entries = await fs.readdir(workDir);
     const subFiles = entries
