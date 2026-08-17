@@ -90,8 +90,11 @@ jobs:
           ffmpeg -version | head -n 1
           # youtube-transcript is IP-blocked on GitHub runners; yt-dlp fetches captions reliably.
           python3 -m pip install --user -U yt-dlp
+          export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           yt-dlp --version
+          # Force CI transcript path to prefer yt-dlp.
+          echo "YT_TRANSCRIPT_ENGINE=ytdlp" >> "$GITHUB_ENV"
       # --------------------------------------------------
       # 4. Install project dependencies
       #
