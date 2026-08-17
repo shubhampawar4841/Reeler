@@ -1,23 +1,27 @@
-# Manual reel generation + YouTube upload (no cron).
-# Repo root = my-app (package.json lives here).
-
 name: Generate Reel
 
 on:
   workflow_dispatch:
     inputs:
       story:
-        description: "Story text for the Short (≥20 characters)"
-        required: true
+        description: "Optional story text. Leave empty to auto-fetch a YouTube transcript."
+        required: false
         type: string
+
+      youtube_url:
+        description: "Optional YouTube URL/ID to pull transcript from (manual testing)."
+        required: false
+        type: string
+
       lang:
-        description: "Language (en or hi)"
+        description: "Language"
         required: false
         default: "en"
         type: choice
         options:
           - en
           - hi
+
       privacy:
         description: "YouTube privacy status"
         required: false
@@ -27,6 +31,7 @@ on:
           - private
           - unlisted
           - public
+
       gender:
         description: "Voice gender"
         required: false
@@ -36,40 +41,159 @@ on:
           - female
           - male
 
+  # Cron is ALWAYS UTC (not IST). GitHub often delays 5–60+ minutes.
+  # Daytime IST (11:00 → 13:00), every 30 min = 5 runs:
+  #   11:00 AM IST = 05:30 UTC
+  #   11:30 AM IST = 06:00 UTC
+  #   12:00 PM IST = 06:30 UTC
+  #   12:30 PM IST = 07:00 UTC
+  #   01:00 PM IST = 07:30 UTC
+  # Evening IST:
+  #   10:15 PM / 11:00 PM / 11:45 PM
+  schedule:
+    - cron: "30 5 * * *"
+    - cron: "0 6 * * *"
+    - cron: "30 6 * * *"
+    - cron: "0 7 * * *"
+    - cron: "30 7 * * *"
+    - cron: "45 16 * * *"
+    - cron: "30 17 * * *"
+    - cron: "15 18 * * *"
+
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    # Video generation can take several minutes.
+    timeout-minutes: 30
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
+      # --------------------------------------------------
+      # 2. Setup Node.js
+      # --------------------------------------------------
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: npm
+          cache-dependency-path: package-lock.json
 
+      # --------------------------------------------------
+      # 3. Install FFmpeg
+      # --------------------------------------------------
       - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      # --------------------------------------------------
+      # 4. Install project dependencies
+      #
+      # npm install is being used temporarily because
+      # npm ci was failing due to the lockfile mismatch.
+      # --------------------------------------------------
       - name: Install npm dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Generate reel and upload to YouTube
+      # --------------------------------------------------
+      # 5. Get story
+      #
+      # Manual:
+      #   story provided -> use it
+      #
+      # Automatic cron:
+      #   no story -> search YouTube + get transcript
+      # --------------------------------------------------
+      - name: Resolve story text
+        id: story
         env:
-          STORY_RENDERER: ffmpeg
-          TTS_ENGINE: edge
-          STORY_TEXT: ${{ inputs.story }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          # Only use form inputs on manual runs (cron has no inputs)
+          STORY_TEXT: ${{ github.event_name == 'workflow_dispatch' && inputs.story || '' }}
+          YT_VIDEO_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.youtube_url || '' }}
+          LANG_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.lang || 'en' }}
+
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-        run: >
-          npx tsx scripts/generate-and-upload-reel.ts
-          --story "$STORY_TEXT"
-          --lang "${{ inputs.lang }}"
-          --privacy "${{ inputs.privacy }}"
-          --gender "${{ inputs.gender }}"
+
+          # Prefer narration-style videos (more likely to have usable captions)
+          YT_SEARCH_QUERIES: "scary story narration english captions|nosleep story reading narration|creepypasta narration english|true scary story told by narrator|reddit scary story narration full|paranormal experience story narration|horror story audiobook short"
+
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/reeler
+          echo "Event: $EVENT_NAME"
+          # Cron / schedule → always auto YouTube transcript (ignore empty inputs)
+          if [ "$EVENT_NAME" = "schedule" ] || [ -z "${STORY_TEXT:-}" ]; then
+            echo "Auto mode: YouTube search → transcript → story input"
+            echo "Queries: $YT_SEARCH_QUERIES"
+            if [ "$EVENT_NAME" != "schedule" ] && [ -n "${YT_VIDEO_URL:-}" ]; then
+              echo "Using manually supplied YouTube URL."
+              npx tsx scripts/fetch-youtube-story.ts \
+                --youtube-url "$YT_VIDEO_URL" \
+                --lang "$LANG_INPUT" \
+                --out /tmp/reeler/story.txt \
+                --meta /tmp/reeler/meta.json
+            else
+              echo "Discovering a YouTube video with captions..."
+              npx tsx scripts/fetch-youtube-story.ts \
+                --lang "$LANG_INPUT" \
+                --out /tmp/reeler/story.txt \
+                --meta /tmp/reeler/meta.json
+            fi
+            echo "source=youtube_transcript" >> "$GITHUB_OUTPUT"
+            echo "----------- SOURCE METADATA -----------"
+            cat /tmp/reeler/meta.json
+            echo "---------------------------------------"
+            wc -c /tmp/reeler/story.txt
+          else
+            echo "Using manually supplied story."
+            printf '%s' "$STORY_TEXT" > /tmp/reeler/story.txt
+            echo "source=manual" >> "$GITHUB_OUTPUT"
+            echo "Story length: ${#STORY_TEXT} characters"
+          fi
+      # --------------------------------------------------
+      # 6. Generate video + upload to YouTube
+      # --------------------------------------------------
+      - name: Generate reel and upload to YouTube
+        env:
+          # Use the lightweight GitHub Actions configuration.
+          STORY_RENDERER: ffmpeg
+          TTS_ENGINE: edge
+
+          # AI
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          # YouTube OAuth
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+
+          # Workflow inputs
+          LANG_INPUT: ${{ inputs.lang || 'en' }}
+          PRIVACY_INPUT: ${{ inputs.privacy || 'private' }}
+          GENDER_INPUT: ${{ inputs.gender || 'female' }}
+
+        run: |
+          set -euo pipefail
+          echo "Reading generated story..."
+          STORY_TEXT="$(cat /tmp/reeler/story.txt)"
+          if [ -z "$STORY_TEXT" ]; then
+            echo "ERROR: Story text is empty."
+            exit 1
+          fi
+          echo "Story length: ${#STORY_TEXT} characters"
+          echo "Starting Reel generation..."
+          npx tsx scripts/generate-and-upload-reel.ts \
+            --story "$STORY_TEXT" \
+            --lang "$LANG_INPUT" \
+            --privacy "$PRIVACY_INPUT" \
+            --gender "$GENDER_INPUT"
+          echo "Reel generation/upload completed successfully."
