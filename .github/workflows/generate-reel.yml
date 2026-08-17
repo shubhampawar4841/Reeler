@@ -25,7 +25,7 @@ on:
       privacy:
         description: "YouTube privacy status"
         required: false
-        default: "private"
+        default: "public"
         type: choice
         options:
           - private
