@@ -33,6 +33,13 @@ export default function Home() {
   const [storyText, setStoryText] = useState("");
   const [storySource, setStorySource] = useState<"manual" | "youtube">("manual");
   const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [randomStoryLoading, setRandomStoryLoading] = useState(false);
+  const [randomStorySource, setRandomStorySource] = useState<{
+    title: string;
+    channel: string;
+    videoUrl: string;
+    durationSec: number;
+  } | null>(null);
   const [storyLoading, setStoryLoading] = useState(false);
   const [storyError, setStoryError] = useState<string | null>(null);
   const [storyVideoUrl, setStoryVideoUrl] = useState<string | null>(null);
@@ -100,6 +107,43 @@ export default function Home() {
       }
     })();
   }, []);
+
+  const fetchRandomStory = async () => {
+    setRandomStoryLoading(true);
+    setStoryError(null);
+    try {
+      const res = await fetch(
+        `/api/youtube/random-story?lang=${encodeURIComponent(storyLang)}`,
+        { cache: "no-store" }
+      );
+      const json = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        text?: string;
+        title?: string;
+        channel?: string;
+        videoUrl?: string;
+        durationSec?: number;
+      };
+      if (!res.ok || !json.ok || !json.text || !json.videoUrl) {
+        throw new Error(json.error ?? `Random story fetch failed (${res.status})`);
+      }
+
+      setStorySource("manual");
+      setStoryText(json.text);
+      setYoutubeUrl(json.videoUrl);
+      setRandomStorySource({
+        title: json.title || "Untitled video",
+        channel: json.channel || "Unknown channel",
+        videoUrl: json.videoUrl,
+        durationSec: json.durationSec ?? 0,
+      });
+    } catch (error) {
+      setStoryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRandomStoryLoading(false);
+    }
+  };
 
   const runStoryVideo = async () => {
     if (storySource === "manual" && storyText.trim().length < 20) return;
@@ -210,6 +254,7 @@ export default function Home() {
 
   const canStoryVideo =
     !storyLoading &&
+    !randomStoryLoading &&
     (storySource === "youtube"
       ? youtubeUrl.trim().length >= 10
       : storyText.trim().length >= 20);
@@ -343,7 +388,17 @@ export default function Home() {
             </label>
 
             <label className="flex flex-col gap-2">
-              <span className="text-sm font-medium text-zinc-300">Story input</span>
+              <span className="flex items-center justify-between gap-3 text-sm font-medium text-zinc-300">
+                Story input
+                <button
+                  type="button"
+                  onClick={() => void fetchRandomStory()}
+                  disabled={storyLoading || randomStoryLoading}
+                  className="rounded-lg border border-violet-700 bg-violet-950/50 px-3 py-1.5 text-xs font-semibold text-violet-200 transition hover:bg-violet-900/60 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {randomStoryLoading ? "Finding story…" : "Get random story"}
+                </button>
+              </span>
               <div className="flex flex-wrap gap-2">
                 <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm has-[:checked]:border-rose-500 has-[:checked]:bg-rose-950/40">
                   <input
@@ -369,6 +424,24 @@ export default function Home() {
                 </label>
               </div>
             </label>
+
+            {randomStorySource && (
+              <div className="rounded-xl border border-emerald-800/70 bg-emerald-950/30 px-3 py-2.5 text-sm text-emerald-100">
+                <p className="font-semibold">Random story loaded — confirm below</p>
+                <p className="mt-1 text-xs text-emerald-300">
+                  {randomStorySource.channel} · {randomStorySource.title} ·{" "}
+                  {formatDuration(randomStorySource.durationSec)}
+                </p>
+                <a
+                  href={randomStorySource.videoUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-block text-xs font-medium text-emerald-300 underline underline-offset-2 hover:text-emerald-200"
+                >
+                  Open source video
+                </a>
+              </div>
+            )}
 
             {storySource === "youtube" ? (
               <label className="flex flex-col gap-2">
@@ -401,6 +474,7 @@ export default function Home() {
                   value={storyText}
                   onChange={(e) => {
                     setStoryText(e.target.value);
+                    setRandomStorySource(null);
                     setStoryError(null);
                   }}
                   disabled={storyLoading}
