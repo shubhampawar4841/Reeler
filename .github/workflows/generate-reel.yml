@@ -91,6 +91,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+          # Full apt build (complete TLS/protocol support) instead of ffmpeg-static.
+          echo "FFMPEG_PATH=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          ffmpeg -version | head -n 1
       # --------------------------------------------------
       # 4. Install project dependencies
       #
