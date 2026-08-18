@@ -36,6 +36,12 @@ public
 # vercel
 .vercel
 
+# YouTube / yt-dlp secrets & local probe artifacts
+cookies.txt
+**/cookies.txt
+test-*.vtt
+*.cookies.txt
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

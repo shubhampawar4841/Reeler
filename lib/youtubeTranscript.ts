@@ -106,7 +106,7 @@ function subtitleFileToPlainText(raw: string): string {
   return deduped.join(" ").replace(/\s+/g, " ").trim();
 }
 
-async function resolveYtDlpBin(): Promise<string | null> {
+export async function resolveYtDlpBin(): Promise<string | null> {
   const fromEnv = process.env.YT_DLP_PATH?.trim();
   if (fromEnv) return fromEnv;
   for (const bin of ["yt-dlp", "yt-dlp.exe"]) {
