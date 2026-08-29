@@ -36,10 +36,20 @@ const ANDROID_CLIENTS: ReadonlyArray<{ version: string; ua: string }> = [
 ];
 
 const COOKIES_HINT =
-  "Set Vercel env YT_DLP_COOKIES to a Netscape YouTube cookies.txt from a logged-in browser (same as GitHub Actions secret).";
+  "Export fresh Netscape cookies while signed into YouTube (Chrome: “Get cookies.txt LOCALLY”), then set Vercel env YT_DLP_COOKIES to the full file. Need login cookies like SAPISID / __Secure-1PSID — visitor-only cookies (VISITOR_INFO1_LIVE) are not enough.";
+
+const LOGIN_COOKIE_NAMES = [
+  "SAPISID",
+  "__Secure-1PSID",
+  "__Secure-3PSID",
+  "SID",
+  "LOGIN_INFO",
+  "__Secure-1PAPISID",
+] as const;
 
 let cachedCookieHeader: string | null | undefined;
 let cachedCookiesFile: string | null | undefined;
+let cachedCookiesLoggedIn: boolean | undefined;
 
 /** Parse Netscape cookies.txt into a Cookie request header for youtube.com. */
 function netscapeToCookieHeader(raw: string): string {
@@ -58,6 +68,15 @@ function netscapeToCookieHeader(raw: string): string {
   return parts.join("; ");
 }
 
+function cookieHeaderLooksLoggedIn(header: string): boolean {
+  if (!header) return false;
+  return LOGIN_COOKIE_NAMES.some((name) =>
+    new RegExp(`(?:^|;\\s*)${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}=`).test(
+      header
+    )
+  );
+}
+
 /**
  * Resolve YouTube cookies for Innertube / yt-dlp.
  * Prefers YT_DLP_COOKIES (raw Netscape text — Vercel/GitHub secret),
@@ -66,9 +85,14 @@ function netscapeToCookieHeader(raw: string): string {
 async function getYoutubeCookies(): Promise<{
   header: string;
   filePath: string | null;
+  loggedIn: boolean;
 }> {
   if (cachedCookieHeader !== undefined) {
-    return { header: cachedCookieHeader ?? "", filePath: cachedCookiesFile ?? null };
+    return {
+      header: cachedCookieHeader ?? "",
+      filePath: cachedCookiesFile ?? null,
+      loggedIn: cachedCookiesLoggedIn ?? false,
+    };
   }
 
   const inline = process.env.YT_DLP_COOKIES?.trim() || "";
@@ -95,9 +119,20 @@ async function getYoutubeCookies(): Promise<{
   }
 
   const header = raw ? netscapeToCookieHeader(raw) : "";
+  const loggedIn = cookieHeaderLooksLoggedIn(header);
   cachedCookieHeader = header || null;
   cachedCookiesFile = filePath;
-  return { header, filePath };
+  cachedCookiesLoggedIn = loggedIn;
+  return { header, filePath, loggedIn };
+}
+
+/** True when Vercel-like hosts need logged-in YouTube cookies to fetch captions. */
+export function youtubeCaptionsNeedLoginCookies(): boolean {
+  return Boolean(
+    process.env.VERCEL ||
+      process.env.VERCEL_ENV ||
+      process.env.GITHUB_ACTIONS === "true"
+  );
 }
 
 export type YoutubeTranscriptSegment = {
@@ -651,6 +686,20 @@ export async function fetchYoutubeStoryText(
   const onVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
   const preferYtDlp = onCi || process.env.YT_TRANSCRIPT_ENGINE === "ytdlp";
   const ytDlpBin = preferYtDlp || !onVercel ? await resolveYtDlpBin() : null;
+
+  if (youtubeCaptionsNeedLoginCookies()) {
+    const { loggedIn, header } = await getYoutubeCookies();
+    if (!header) {
+      throw new Error(
+        `YouTube bot-check on this host (no YT_DLP_COOKIES). ${COOKIES_HINT}`
+      );
+    }
+    if (!loggedIn) {
+      throw new Error(
+        `YT_DLP_COOKIES is set but missing login session cookies (SAPISID / __Secure-1PSID). ${COOKIES_HINT}`
+      );
+    }
+  }
 
   const attempts: Array<() => Promise<FetchYoutubeStoryResult>> = [];
   if (preferYtDlp && ytDlpBin) {

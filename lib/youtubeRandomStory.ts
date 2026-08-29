@@ -217,6 +217,14 @@ export async function findRandomYoutubeStory(
         const reason = error instanceof Error ? error.message : String(error);
         onLog(`  ${video.videoId}: ${reason.slice(0, 400)}`);
         lastTranscriptError = reason;
+        // Cookies / bot-check — retrying every video wastes the whole request.
+        if (
+          /LOGIN_REQUIRED|missing login session cookies|no YT_DLP_COOKIES|bot-check/i.test(
+            reason
+          )
+        ) {
+          throw new Error(reason);
+        }
       }
     }
   }
