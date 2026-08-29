@@ -9,12 +9,24 @@ import {
 const execFileAsync = promisify(execFile);
 
 export const STORY_CHANNELS = [
-  { id: "UCLzBmIXyMCU3823_KTmSrRA", name: "Scary Window" },
-  { id: "UCC8jAloh4KND0OvEB3o25GQ", name: "Unknown Whispers" },
-  { id: "UC9SCSAwMFZ-XFjR2SrlnJUw", name: "Spooky Hindi Stories" },
-  { id: "UCxkNn4i8k0YYoe6_TKvBAig", name: "True or False Scary Stories" },
-  { id: "UCAayg87bUguD2dzrc_O-bjQ", name: "Suno Ek Kahani Official" },
-  { id: "UCbNp5Gl_5QSFNZmRytT41Fw", name: "Scary Hub" },
+  { id: "UCLzBmIXyMCU3823_KTmSrRA", name: "Scary Window", langs: ["en"] },
+  { id: "UCC8jAloh4KND0OvEB3o25GQ", name: "Unknown Whispers", langs: ["en"] },
+  {
+    id: "UC9SCSAwMFZ-XFjR2SrlnJUw",
+    name: "Spooky Hindi Stories",
+    langs: ["hi"],
+  },
+  {
+    id: "UCxkNn4i8k0YYoe6_TKvBAig",
+    name: "True or False Scary Stories",
+    langs: ["en"],
+  },
+  {
+    id: "UCAayg87bUguD2dzrc_O-bjQ",
+    name: "Suno Ek Kahani Official",
+    langs: ["hi"],
+  },
+  { id: "UCbNp5Gl_5QSFNZmRytT41Fw", name: "Scary Hub", langs: ["en"] },
 ] as const;
 
 export type RandomYoutubeStory = {
@@ -34,6 +46,17 @@ function shuffled<T>(items: readonly T[]): T[] {
     [result[i], result[j]] = [result[j]!, result[i]!];
   }
   return result;
+}
+
+/** Prefer channels that match the story language, then try the rest. */
+function channelsForLang(lang: "en" | "hi") {
+  const preferred = STORY_CHANNELS.filter((c) =>
+    (c.langs as readonly string[]).includes(lang)
+  );
+  const other = STORY_CHANNELS.filter(
+    (c) => !(c.langs as readonly string[]).includes(lang)
+  );
+  return [...shuffled(preferred), ...shuffled(other)];
 }
 
 async function videosFromChannelOauth(
@@ -163,7 +186,7 @@ export async function findRandomYoutubeStory(
   let lastTranscriptError = "";
   let lastListError = "";
 
-  for (const channel of shuffled(STORY_CHANNELS)) {
+  for (const channel of channelsForLang(lang)) {
     onLog(`Checking random stories from ${channel.name}…`);
     let videos: Array<{ videoId: string; title: string }>;
     try {
@@ -176,7 +199,7 @@ export async function findRandomYoutubeStory(
     }
 
     onLog(`  ${videos.length} video(s) listed; trying transcripts…`);
-    for (const video of videos.slice(0, 12)) {
+    for (const video of videos.slice(0, 8)) {
       try {
         const transcript = await fetchYoutubeStoryText(video.videoId, { lang });
         if (transcript.text.length < 80) {

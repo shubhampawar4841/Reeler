@@ -1,7 +1,8 @@
 /**
  * Fetch YouTube captions.
  * Primary: youtube-transcript (works locally).
- * Fallback: yt-dlp (needed on GitHub Actions — YouTube blocks the scrape API from runner IPs).
+ * Fallback: Innertube ANDROID client (works on Vercel — no yt-dlp binary).
+ * Last resort: yt-dlp (CI / local when installed).
  */
 
 import { execFile } from "node:child_process";
@@ -12,6 +13,9 @@ import { promisify } from "node:util";
 import { fetchTranscript } from "youtube-transcript";
 
 const execFileAsync = promisify(execFile);
+
+/** Public Innertube key embedded in YouTube clients (not a secret). */
+const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
 export type YoutubeTranscriptSegment = {
   text: string;
@@ -256,6 +260,203 @@ async function fetchViaYtDlp(
   }
 }
 
+type InnertubeCaptionTrack = {
+  baseUrl?: string;
+  languageCode?: string;
+  kind?: string;
+  name?: { simpleText?: string };
+};
+
+function pickCaptionTrack(
+  tracks: InnertubeCaptionTrack[],
+  lang?: "en" | "hi"
+): InnertubeCaptionTrack | null {
+  if (!tracks.length) return null;
+  const prefer = lang === "hi" ? ["hi", "en"] : ["en", "hi"];
+  for (const code of prefer) {
+    const exact = tracks.find(
+      (t) => t.languageCode === code && t.baseUrl && t.kind !== "asr"
+    );
+    if (exact) return exact;
+    const asr = tracks.find(
+      (t) => t.languageCode === code && t.baseUrl && t.kind === "asr"
+    );
+    if (asr) return asr;
+    const any = tracks.find(
+      (t) => t.languageCode?.startsWith(code) && t.baseUrl
+    );
+    if (any) return any;
+  }
+  return tracks.find((t) => t.baseUrl) ?? null;
+}
+
+function parseTimedTextXml(xml: string): YoutubeTranscriptSegment[] {
+  const segments: YoutubeTranscriptSegment[] = [];
+  const re =
+    /<text\b[^>]*\bstart="([^"]+)"[^>]*\bdur="([^"]+)"[^>]*>([\s\S]*?)<\/text>/gi;
+  for (const m of xml.matchAll(re)) {
+    const offset = Number(m[1]);
+    const duration = Number(m[2]);
+    const text = decodeEntities(
+      String(m[3] ?? "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+    if (!text || !Number.isFinite(offset)) continue;
+    segments.push({
+      text,
+      offset,
+      duration: Number.isFinite(duration) ? duration : 0,
+    });
+  }
+  return segments;
+}
+
+function parseJson3Events(raw: string): YoutubeTranscriptSegment[] {
+  try {
+    const data = JSON.parse(raw) as {
+      events?: Array<{
+        tStartMs?: number;
+        dDurationMs?: number;
+        segs?: Array<{ utf8?: string }>;
+      }>;
+    };
+    const segments: YoutubeTranscriptSegment[] = [];
+    for (const ev of data.events ?? []) {
+      const text = (ev.segs ?? [])
+        .map((s) => s.utf8 ?? "")
+        .join("")
+        .replace(/\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text || text === "\n") continue;
+      segments.push({
+        text,
+        offset: (Number(ev.tStartMs) || 0) / 1000,
+        duration: (Number(ev.dDurationMs) || 0) / 1000,
+      });
+    }
+    return segments;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Innertube player API as ANDROID client — works on Vercel/datacenter IPs
+ * where youtube-transcript HTML scraping often reports "Transcript is disabled".
+ */
+async function fetchViaInnertube(
+  videoId: string,
+  lang?: "en" | "hi"
+): Promise<FetchYoutubeStoryResult> {
+  const playerRes = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":
+          "com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip",
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "ANDROID",
+            clientVersion: "19.29.37",
+            hl: lang === "hi" ? "hi" : "en",
+            gl: "US",
+          },
+        },
+        videoId,
+        contentDetails: true,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    }
+  );
+
+  if (!playerRes.ok) {
+    throw new Error(`Innertube player HTTP ${playerRes.status}`);
+  }
+
+  const player = (await playerRes.json()) as {
+    playabilityStatus?: { status?: string; reason?: string };
+    captions?: {
+      playerCaptionsTracklistRenderer?: {
+        captionTracks?: InnertubeCaptionTrack[];
+      };
+    };
+  };
+
+  const status = player.playabilityStatus?.status;
+  if (status && status !== "OK") {
+    throw new Error(
+      `Innertube playability ${status}: ${player.playabilityStatus?.reason ?? "unknown"}`
+    );
+  }
+
+  const tracks =
+    player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  const track = pickCaptionTrack(tracks, lang);
+  if (!track?.baseUrl) {
+    throw new Error("Innertube: no caption tracks on this video");
+  }
+
+  // Prefer json3 when available; fall back to default XML timedtext.
+  const base = track.baseUrl.replace(/&fmt=\w+/g, "");
+  const urls = [`${base}&fmt=json3`, base];
+  let segments: YoutubeTranscriptSegment[] = [];
+  let lastErr = "";
+
+  for (const url of urls) {
+    try {
+      const subRes = await fetch(url, {
+        headers: {
+          "User-Agent":
+            "com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip",
+        },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!subRes.ok) {
+        lastErr = `HTTP ${subRes.status}`;
+        continue;
+      }
+      const body = await subRes.text();
+      segments = body.trimStart().startsWith("{")
+        ? parseJson3Events(body)
+        : parseTimedTextXml(body);
+      if (segments.length) break;
+      lastErr = "empty caption payload";
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  if (!segments.length) {
+    throw new Error(`Innertube captions empty (${lastErr || "no data"})`);
+  }
+
+  const text = segmentsToPlainText(segments);
+  if (text.length < 20) {
+    throw new Error("Innertube transcript too short");
+  }
+
+  const last = segments[segments.length - 1]!;
+  const durationSec = Math.max(
+    0,
+    (Number(last.offset) || 0) + (Number(last.duration) || 0)
+  );
+
+  return {
+    videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+    videoId,
+    text,
+    segmentCount: segments.length,
+    durationSec,
+  };
+}
+
 async function fetchViaPackage(
   videoId: string,
   lang?: "en" | "hi"
@@ -312,7 +513,7 @@ async function fetchViaPackage(
 
 /**
  * Pull captions for a YouTube URL/ID and flatten to one story string.
- * On GitHub Actions, prefers yt-dlp because youtube-transcript is IP-blocked.
+ * Order: local prefers package; Vercel prefers Innertube; CI prefers yt-dlp.
  */
 export async function fetchYoutubeStoryText(
   youtubeUrlOrId: string,
@@ -327,11 +528,24 @@ export async function fetchYoutubeStoryText(
 
   const lang = opts?.lang;
   const onCi = process.env.GITHUB_ACTIONS === "true";
+  const onVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
   const preferYtDlp = onCi || process.env.YT_TRANSCRIPT_ENGINE === "ytdlp";
+  const ytDlpBin = preferYtDlp || !onVercel ? await resolveYtDlpBin() : null;
 
-  const attempts: Array<() => Promise<FetchYoutubeStoryResult>> = preferYtDlp
-    ? [() => fetchViaYtDlp(videoId, lang), () => fetchViaPackage(videoId, lang)]
-    : [() => fetchViaPackage(videoId, lang), () => fetchViaYtDlp(videoId, lang)];
+  const attempts: Array<() => Promise<FetchYoutubeStoryResult>> = [];
+  if (preferYtDlp && ytDlpBin) {
+    attempts.push(() => fetchViaYtDlp(videoId, lang));
+  }
+  if (onVercel || preferYtDlp) {
+    attempts.push(() => fetchViaInnertube(videoId, lang));
+    attempts.push(() => fetchViaPackage(videoId, lang));
+  } else {
+    attempts.push(() => fetchViaPackage(videoId, lang));
+    attempts.push(() => fetchViaInnertube(videoId, lang));
+  }
+  if (ytDlpBin && !preferYtDlp) {
+    attempts.push(() => fetchViaYtDlp(videoId, lang));
+  }
 
   const errors: string[] = [];
   for (const attempt of attempts) {
