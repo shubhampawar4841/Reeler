@@ -1,8 +1,11 @@
 /**
  * Fetch YouTube captions.
- * Primary: youtube-transcript (works locally).
- * Fallback: Innertube ANDROID client (works on Vercel — no yt-dlp binary).
+ * Primary: youtube-transcript (works locally / residential IPs).
+ * Fallback: Innertube ANDROID (+ cookies on Vercel — datacenter IPs get LOGIN_REQUIRED).
  * Last resort: yt-dlp (CI / local when installed).
+ *
+ * On Vercel set env YT_DLP_COOKIES to a Netscape cookies.txt export from a logged-in
+ * YouTube browser session (same secret used by GitHub Actions).
  */
 
 import { execFile } from "node:child_process";
@@ -19,8 +22,7 @@ const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
 /**
  * ANDROID client versions.
- * 19.29.x (and similar) now return HTTP 400 "Precondition check failed".
- * 20.10.38 works for caption track listing.
+ * 19.29.x returns HTTP 400 now; 20.10.38 lists caption tracks when not bot-blocked.
  */
 const ANDROID_CLIENTS: ReadonlyArray<{ version: string; ua: string }> = [
   {
@@ -32,6 +34,71 @@ const ANDROID_CLIENTS: ReadonlyArray<{ version: string; ua: string }> = [
     ua: "com.google.android.youtube/19.47.38 (Linux; U; Android 14) gzip",
   },
 ];
+
+const COOKIES_HINT =
+  "Set Vercel env YT_DLP_COOKIES to a Netscape YouTube cookies.txt from a logged-in browser (same as GitHub Actions secret).";
+
+let cachedCookieHeader: string | null | undefined;
+let cachedCookiesFile: string | null | undefined;
+
+/** Parse Netscape cookies.txt into a Cookie request header for youtube.com. */
+function netscapeToCookieHeader(raw: string): string {
+  const parts: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const cols = t.split("\t");
+    if (cols.length < 7) continue;
+    const domain = cols[0] ?? "";
+    const name = cols[5] ?? "";
+    const value = cols[6] ?? "";
+    if (!name || !/youtube\.com$/i.test(domain.replace(/^\./, ""))) continue;
+    parts.push(`${name}=${value}`);
+  }
+  return parts.join("; ");
+}
+
+/**
+ * Resolve YouTube cookies for Innertube / yt-dlp.
+ * Prefers YT_DLP_COOKIES (raw Netscape text — Vercel/GitHub secret),
+ * then YT_DLP_COOKIES_FILE (path).
+ */
+async function getYoutubeCookies(): Promise<{
+  header: string;
+  filePath: string | null;
+}> {
+  if (cachedCookieHeader !== undefined) {
+    return { header: cachedCookieHeader ?? "", filePath: cachedCookiesFile ?? null };
+  }
+
+  const inline = process.env.YT_DLP_COOKIES?.trim() || "";
+  const fileFromEnv = process.env.YT_DLP_COOKIES_FILE?.trim() || "";
+
+  let raw = "";
+  let filePath: string | null = null;
+
+  if (inline) {
+    raw = inline.includes("\\n") ? inline.replace(/\\n/g, "\n") : inline;
+    try {
+      filePath = path.join(os.tmpdir(), "reeler-youtube-cookies.txt");
+      await fs.writeFile(filePath, raw.endsWith("\n") ? raw : `${raw}\n`, "utf8");
+    } catch {
+      filePath = null;
+    }
+  } else if (fileFromEnv) {
+    try {
+      raw = await fs.readFile(fileFromEnv, "utf8");
+      filePath = fileFromEnv;
+    } catch {
+      raw = "";
+    }
+  }
+
+  const header = raw ? netscapeToCookieHeader(raw) : "";
+  cachedCookieHeader = header || null;
+  cachedCookiesFile = filePath;
+  return { header, filePath };
+}
 
 export type YoutubeTranscriptSegment = {
   text: string;
@@ -153,7 +220,7 @@ async function fetchViaYtDlp(
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "reeler-subs-"));
   const outTpl = path.join(workDir, videoId);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const cookiesFile = process.env.YT_DLP_COOKIES_FILE?.trim() || "";
+  const { filePath: cookiesFile } = await getYoutubeCookies();
 
   const langPref =
     process.env.GITHUB_ACTIONS === "true" ||
@@ -355,16 +422,20 @@ function parseJson3Events(raw: string): YoutubeTranscriptSegment[] {
 async function listCaptionTracks(
   videoId: string,
   lang: "en" | "hi" | undefined,
-  client: { version: string; ua: string }
+  client: { version: string; ua: string },
+  cookieHeader: string
 ): Promise<{ tracks: CaptionTrack[]; ua: string }> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": client.ua,
+  };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+
   const playerRes = await fetch(
     `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": client.ua,
-      },
+      headers,
       body: JSON.stringify({
         context: {
           client: {
@@ -375,6 +446,8 @@ async function listCaptionTracks(
           },
         },
         videoId,
+        contentCheckOk: true,
+        racyCheckOk: true,
       }),
       signal: AbortSignal.timeout(20_000),
     }
@@ -395,9 +468,13 @@ async function listCaptionTracks(
 
   const status = player.playabilityStatus?.status;
   if (status && status !== "OK") {
-    throw new Error(
-      `Innertube playability ${status}: ${player.playabilityStatus?.reason ?? "unknown"}`
-    );
+    const reason = player.playabilityStatus?.reason ?? "unknown";
+    if (/LOGIN_REQUIRED|Sign in to confirm/i.test(`${status} ${reason}`)) {
+      throw new Error(
+        `Innertube playability LOGIN_REQUIRED (bot check). ${COOKIES_HINT}`
+      );
+    }
+    throw new Error(`Innertube playability ${status}: ${reason}`);
   }
 
   const tracks =
@@ -409,20 +486,26 @@ async function listCaptionTracks(
 }
 
 /**
- * Innertube ANDROID player — works on Vercel/datacenter IPs where
- * youtube-transcript HTML scraping often reports "Transcript is disabled".
+ * Innertube ANDROID player. On Vercel datacenter IPs YouTube returns
+ * LOGIN_REQUIRED unless YT_DLP_COOKIES is set.
  */
 async function fetchViaInnertube(
   videoId: string,
   lang?: "en" | "hi"
 ): Promise<FetchYoutubeStoryResult> {
+  const { header: cookieHeader } = await getYoutubeCookies();
   let tracks: CaptionTrack[] = [];
   let ua = ANDROID_CLIENTS[0]!.ua;
   const playerErrors: string[] = [];
 
   for (const client of ANDROID_CLIENTS) {
     try {
-      const result = await listCaptionTracks(videoId, lang, client);
+      const result = await listCaptionTracks(
+        videoId,
+        lang,
+        client,
+        cookieHeader
+      );
       tracks = result.tracks;
       ua = result.ua;
       break;
@@ -432,7 +515,11 @@ async function fetchViaInnertube(
   }
 
   if (!tracks.length) {
-    throw new Error(playerErrors.join(" | ") || "Innertube player failed");
+    const joined = playerErrors.join(" | ") || "Innertube player failed";
+    if (/LOGIN_REQUIRED/i.test(joined) && !cookieHeader) {
+      throw new Error(`${joined} (no YT_DLP_COOKIES configured)`);
+    }
+    throw new Error(joined);
   }
 
   const track = pickCaptionTrack(tracks, lang);
@@ -447,8 +534,10 @@ async function fetchViaInnertube(
 
   for (const url of urls) {
     try {
+      const subHeaders: Record<string, string> = { "User-Agent": ua };
+      if (cookieHeader) subHeaders.Cookie = cookieHeader;
       const subRes = await fetch(url, {
-        headers: { "User-Agent": ua },
+        headers: subHeaders,
         signal: AbortSignal.timeout(20_000),
       });
       if (!subRes.ok) {
