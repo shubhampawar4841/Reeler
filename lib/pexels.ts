@@ -83,6 +83,45 @@ export async function searchPexelsVideo(query: string): Promise<{
   throw new Error(`Pexels returned videos but no usable MP4 for: "${query}"`);
 }
 
+function shortenUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const base = path.posix.basename(u.pathname);
+    return `${u.host}/…/${decodeURIComponent(base).slice(0, 80)}`;
+  } catch {
+    return url.slice(0, 120);
+  }
+}
+
+function formatDownloadError(err: unknown, url: string): Error {
+  const short = shortenUrl(url);
+  if (err instanceof Error) {
+    const name = err.name || "Error";
+    const msg = err.message || String(err);
+    if (name === "AbortError" || /aborted|timeout/i.test(msg)) {
+      return new Error(`Download timed out for ${short}: ${msg}`);
+    }
+    if (/fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network/i.test(msg)) {
+      return new Error(
+        `Download network error for ${short}: ${msg}` +
+          (err.cause ? ` (cause: ${String(err.cause)})` : "")
+      );
+    }
+    return new Error(`Download failed for ${short}: ${msg}`);
+  }
+  return new Error(`Download failed for ${short}: ${String(err)}`);
+}
+
+function isRetryableDownloadError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  const msg = err.message || "";
+  if (/HTTP (404|410|401|403)/i.test(msg)) return false;
+  if (/file too small/i.test(msg)) return true;
+  return /timed out|network error|fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|HTTP (408|425|429|500|502|503|504)/i.test(
+    msg
+  );
+}
+
 export async function downloadToFile(
   url: string,
   destPath: string,
@@ -109,12 +148,19 @@ export async function downloadToFile(
         const res = await fetch(url, {
           signal: ctrl.signal,
           redirect: "follow",
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (compatible; ReelerBot/1.0; +https://github.com/shubhampawar4841/Reeler)",
+            Accept: "video/mp4,video/*,*/*;q=0.8",
+          },
         });
         if (!res.ok) {
-          throw new Error(`Download failed (HTTP ${res.status})`);
+          throw new Error(`Download failed (HTTP ${res.status}) for ${shortenUrl(url)}`);
         }
         if (!res.body) {
-          throw new Error("Download failed (empty response body)");
+          throw new Error(
+            `Download failed (empty response body) for ${shortenUrl(url)}`
+          );
         }
         // Stream to disk — avoid buffering entire MP4 in RAM
         await pipeline(
@@ -127,17 +173,22 @@ export async function downloadToFile(
 
       const st = await fs.stat(partPath);
       if (st.size < 1000) {
-        throw new Error(`Download failed (file too small: ${st.size} bytes)`);
+        throw new Error(
+          `Download failed (file too small: ${st.size} bytes) for ${shortenUrl(url)}`
+        );
       }
       await fs.rename(partPath, destPath);
       return;
     } catch (e) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
+      lastErr = formatDownloadError(e, url);
       await fs.rm(partPath, { force: true }).catch(() => {});
       await fs.rm(destPath, { force: true }).catch(() => {});
-      if (attempt < retries) {
+      const retry = attempt < retries && isRetryableDownloadError(lastErr);
+      if (retry) {
         await new Promise((r) => setTimeout(r, 400 * attempt));
+        continue;
       }
+      break;
     }
   }
 

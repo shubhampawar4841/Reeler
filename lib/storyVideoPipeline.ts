@@ -229,50 +229,80 @@ async function resolveBrollPool(
   }
 
   const catalog = await listBrollCatalog();
-  let picked: BrollCatalogItem | null = findBrollById(
-    catalog,
-    options.brollId
-  );
+  const explicit = findBrollById(catalog, options.brollId);
+  const autoPick = !explicit;
 
-  if (!picked) {
-    picked = catalog[Math.floor(Math.random() * catalog.length)] ?? null;
-    if (picked) {
-      onLog(`B-roll: auto-picked "${picked.label}" (${picked.kind})`);
-    }
-  } else {
-    onLog(`B-roll: selected "${picked.label}" (${picked.kind})`);
-  }
+  // Auto mode: shuffle remotes so we can fall through if one URL fails.
+  const candidates: BrollCatalogItem[] = explicit
+    ? [explicit]
+    : (() => {
+        const remote = catalog.filter((c) => c.kind === "remote");
+        const pool = remote.length > 0 ? remote : catalog;
+        const shuffled = [...pool];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+        }
+        return shuffled;
+      })();
 
-  if (!picked) {
+  if (candidates.length === 0) {
     throw new Error(
       "No B-roll available. Configure REMOTE_BROLL in lib/brollCatalog.ts (or set BROLL_INCLUDE_LOCAL=1)."
     );
   }
 
-  let ffmpegSrc = brollFfmpegInput(picked);
-  if (picked.kind === "remote" || /^https?:\/\//i.test(ffmpegSrc)) {
-    const localPath = path.join(workDir, "broll-remote.mp4");
-    onLog(`Downloading remote B-roll to temp (${picked.id})…`);
-    await downloadToFile(ffmpegSrc, localPath, {
-      timeoutMs: 120_000,
-      retries: 3,
-    });
-    ffmpegSrc = localPath;
-    onLog(`Remote B-roll saved locally for FFmpeg`);
+  if (explicit) {
+    onLog(`B-roll: selected "${explicit.label}" (${explicit.kind})`);
   } else {
-    onLog(`Seeking local file (no copy): ${picked.src}`);
+    onLog(
+      `B-roll: auto mode — will try up to ${Math.min(candidates.length, 5)} catalog clip(s)`
+    );
   }
 
-  const dur = await probeDurationSec(ffmpegSrc);
-  onLog(
-    `B-roll duration ${dur.toFixed(1)}s — FFmpeg will -ss / -t the needed window only`
-  );
+  const localPath = path.join(workDir, "broll-remote.mp4");
+  let lastErr: Error | null = null;
+  const maxAutoTries = explicit ? 1 : Math.min(candidates.length, 5);
 
-  return {
-    usedUpload: false,
-    poolLabel: picked.label,
-    poolMeta: [{ path: ffmpegSrc, dur, label: picked.label }],
-  };
+  for (let i = 0; i < maxAutoTries; i++) {
+    const picked = candidates[i]!;
+    if (autoPick) {
+      onLog(`B-roll: trying "${picked.label}" (${picked.kind})…`);
+    }
+
+    try {
+      let ffmpegSrc = brollFfmpegInput(picked);
+      if (picked.kind === "remote" || /^https?:\/\//i.test(ffmpegSrc)) {
+        onLog(`Downloading remote B-roll to temp (${picked.id})…`);
+        await downloadToFile(ffmpegSrc, localPath, {
+          timeoutMs: 120_000,
+          retries: 3,
+        });
+        ffmpegSrc = localPath;
+        onLog(`Remote B-roll saved locally for FFmpeg`);
+      } else {
+        onLog(`Seeking local file (no copy): ${picked.src}`);
+      }
+
+      const dur = await probeDurationSec(ffmpegSrc);
+      onLog(
+        `B-roll duration ${dur.toFixed(1)}s — FFmpeg will -ss / -t the needed window only`
+      );
+
+      return {
+        usedUpload: false,
+        poolLabel: picked.label,
+        poolMeta: [{ path: ffmpegSrc, dur, label: picked.label }],
+      };
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      onLog(`B-roll download failed for "${picked.label}": ${lastErr.message}`);
+      if (!autoPick || i === maxAutoTries - 1) break;
+      onLog(`Trying another catalog clip…`);
+    }
+  }
+
+  throw lastErr ?? new Error("Failed to download B-roll from catalog");
 }
 
 function escapePathForFilter(p: string): string {
